@@ -1,105 +1,87 @@
-<a href='https://ko-fi.com/O3N726LJT4' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
-
-<img width="1600" height="1120" alt="preview png" src="https://github.com/user-attachments/assets/df68baa0-a1b8-4d63-8e0e-78bf6dcaf091" />
-<img width="1920" height="1015" alt="screenshot-2026-09-14_19-03-49" src="https://github.com/user-attachments/assets/8916a4b1-c37b-48c0-b900-ed631b80b4c3" />
-<img width="1920" height="1015" alt="screenshot-2026-09-14_19-06-50" src="https://github.com/user-attachments/assets/4792270b-a501-4561-b7b1-67c0697b3fab" />
-<img width="1920" height="993" alt="screenshot-2026-09-14_19-05-38" src="https://github.com/user-attachments/assets/26bd46ed-ddda-4b42-aa25-7f81124c9b9b" />
-Like the plugin? ♥️ it on the Omarchy Marketplace to help others find it.
-
 # OmaControl
 
-An Omarchy shell plugin (Quickshell, Hyprland) that turns your top-bar icon into an advanced task manager — live system monitoring, per-app history, process control, and privacy alerts.
+A task manager in your Omarchy top bar: live CPU, memory, GPU, disk and
+network stats, per-app history, process control, and alerts when an app uses
+your camera, microphone or location.
 
-## Features
+<img width="1600" height="1120" alt="OmaControl preview" src="https://github.com/user-attachments/assets/df68baa0-a1b8-4d63-8e0e-78bf6dcaf091" />
 
-- **Live bar stats** — CPU, temps, RAM, network, and more as a compact, customizable icon
-- **App Window** with tabs for Activity (live graphs, 1H/6H/1D), Apps (running processes + trust status), Alerts, Events, and Settings
-- **Per-app details** — CPU/mem/GPU/I/O history, provenance, and live socket counts (no root needed)
-- **Privacy alerts** — notified when camera, mic, or location get used
-- **Process control** — kill, suspend/resume, renice, or permanently disable an app
-- **Historical database** — SQLite-backed samples every 2s, downsampled over time
-- **Sustained alert hysteresis** — resource alarms must hold across samples and stay latched for a grace window, so the bell doesn't flicker near a threshold
-- **Privacy-tier alerts** — process-level spikes are toggleable via the "App Activity" sensitivity, so the window can stop naming specific processes
-- **Per-process network attribution** — optional toggle; turning it off hides the per-process net column entirely (instead of showing zeroes)
-- **Adaptive sampling + stale indicator** — the bar back-off when idle and warns when fresh data stops arriving
-- **Configurable alert sensitivity** — alert thresholds resolve from a single model (mild / medium / severe profiles, with per-metric overrides) shared by the bar, app window, and CLI; switch from the Settings tab or `omcontrol alert-prefs set-profile <mild|medium|severe>`
-- **Self-healing config + storage** — a corrupt `alert_prefs.json` / `barstats.json` is quarantined to `<file>.corrupt` (with a warning) instead of silently passing bad state, and alert-prefs writes are atomic; collector health is tracked so `omcontrol status` reports healthy/stale/failed sampling
+This is a fork of [Davedes83/OmaControl](https://github.com/Davedes83/OmaControl)
+with performance, privacy and accuracy fixes (see below).
 
-## Installation
+## Install
 
 ```bash
-omarchy plugin add https://github.com/Davedes83/OmaControl.git --enable
+omarchy plugin add https://github.com/spaghetticodez/OmaControl.git --enable
 ```
 
-Add the widget to `~/.config/omarchy/shell.json`:
+Pick a bar section when asked. Update later with
+`omarchy plugin update davedes.omcontrol`.
 
-```json
-{
-  "bar": {
-    "layout": {
-      "right": [{ "id": "davedes.omcontrol" }]
-    }
-  }
-}
-```
+Needs `sqlite3` and `python3`. GPU stats use `nvidia-smi` or AMD's sysfs.
+
+## Use
+
+- **Left-click** opens the app window: live graphs, running apps, alerts,
+  events and settings.
+- **Middle-click** refreshes.
+- **Right-click** opens a menu: jump to a tab, apply rules, stop the top
+  process.
+
+From the app window you can stop, pause, resume or reprioritize an app, or
+block it from starting again. History is kept in
+`~/.local/share/omcontrol/history.db`.
+
+The plugin folder also has a command-line tool:
 
 ```bash
-omarchy restart shell
+~/.config/omarchy/plugins/davedes.omcontrol/omcontrol status
+~/.config/omarchy/plugins/davedes.omcontrol/omcontrol --help
 ```
 
-### Optional: background history sampler
-
-The bar widget and CLI record while the shell is running. To also fill history
-when the shell is closed, enable the hardened user service (fixed `PATH`,
-`LC_ALL=C`, strict umask, process-group timeouts on every helper):
+### Record history while the shell is closed (optional)
 
 ```bash
 systemctl --user enable --now ~/.config/omarchy/plugins/davedes.omcontrol/systemd/omcontrol-collect.service
 ```
 
-Verify: `systemctl --user status omcontrol-collect` and `omcontrol status`.
+## What this fork changes
 
-## Usage
-
-- **Left-click** — open/close the App Window
-- **Middle-click** — refresh sample
-- **Right-click** — context menu (jump to tab, enforce rules, kill top process)
-
-Also ships a CLI — `omcontrol status [--json]`, `omcontrol top [--history 30m] [--sort peak|cpu|mem|combined] [--json|--csv]`, `omcontrol history [--metric cpu] [--seconds 300] [--json|--csv]`, `omcontrol app kill <name>`, `omcontrol prune [--metrics|--procs|--events]`, `omcontrol vacuum`, and `omcontrol alert-prefs ...` — run `omcontrol --help` for the full list.
+- **Lighter:** the collector uses about 70% less CPU per update and no
+  longer pauses on each update.
+- **Live CPU:** the process list shows what is using the CPU right now, like
+  `top`, instead of an average over each process's lifetime.
+- **Private:** command lines (which can hold passwords or tokens) are no
+  longer saved to the history database, and old ones are wiped.
+- **AMD CPU temperature** works (it showed 0 °C on Ryzen boards).
+- Smaller fixes: btrfs subvolumes show as one disk, short-lived state lives
+  in RAM instead of on disk, and collector errors are no longer hidden.
 
 ## Remove
 
 ```bash
-omarchy plugin remove davedes.omcontrol
 systemctl --user disable --now omcontrol-collect
+omarchy plugin remove davedes.omcontrol
+rm -rf ~/.local/share/omcontrol   # history and settings
 ```
 
-## Requirements
-
-- [Omarchy](https://omarchy.org/) Linux, Hyprland, Quickshell
-- `sqlite3`, `python3`, `nvidia-smi` (optional, for GPU metrics)
-
-## Development / Testing
-
-The test suite exercises the schema migration/repair paths, the collector
-end-to-end, `prefs.py` validation + lock/atomic-rename concurrency, corruption
-quarantine for both preference stores, alert-threshold profile/override
-resolution, and the enforcement dry-run contract (mocked systemctl) — all
-against throwaway state, so the user's real `history.db` is never touched.
-Run it under any shell you like:
+## Development
 
 ```bash
-tests/run-tests.sh              # default: sh
-tests/run-tests.sh dash         # strict POSIX (Debian/Ubuntu default sh)
-tests/run-tests.sh bash --posix # bash in POSIX compatibility mode
+tests/run-tests.sh bash
+tests/run-tests.sh "bash --posix"
 ```
 
-CI (`.github/workflows/ci.yml`) runs the suite under `dash`, `bash`, and
-`bash --posix`, plus static gates: shellcheck, `shfmt --diff`, Python
-`compileall`, JSON validation, and a structural QML/JS bracket-balance check.
-`qmllint` runs as an informational step only — it needs the Quickshell module
-tree the CI image doesn't ship.
+CI runs the tests under `dash`, `bash` and `bash --posix`, plus shellcheck
+and shfmt. Tests use throwaway data, never your real history.
 
-## License
+## Credits
 
-MIT
+OmaControl was created by **Davedes83**:
+[github.com/Davedes83/OmaControl](https://github.com/Davedes83/OmaControl).
+Like the plugin? ♥️ it on the Omarchy Marketplace to help others find it,
+and support the author:
+
+<a href='https://ko-fi.com/O3N726LJT4' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+
+MIT license.
