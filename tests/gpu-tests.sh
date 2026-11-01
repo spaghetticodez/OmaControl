@@ -114,6 +114,30 @@ check_eq "gpu (valid): all fields parsed from CSV + XML" "0" "$?"
 check_eq "gpu (valid): gpu_pct persisted into metrics" "95.0" "$(q "$T/valid/history.db" "SELECT gpu_pct FROM metrics;")"
 check_eq "gpu (valid): gpu_temp persisted into metrics" "68" "$(q "$T/valid/history.db" "SELECT gpu_temp FROM metrics;")"
 
+# Second tick in the same run dir: identity fields come from the parsed
+# cache (gpu.info), not a fresh parse, and must be identical.
+run_interp "$ROOT/backend/collect.sh" >"$T/valid/out2.json" 2>/dev/null
+python3 - "$T/valid/out.json" "$T/valid/out2.json" <<'PY'
+import json, sys
+a, b = (json.load(open(f)) for f in sys.argv[1:3])
+for k in ("gpu_name", "gpu_driver", "gpu_power_max_w", "gpu_link_gen", "gpu_link_width_max",
+          "gpu_bus", "gpu_mem_clock_mhz", "gpu_mem_clock_max_mhz", "gpu_graphics_max_mhz"):
+    assert a[k] == b[k], "%s: %r vs %r" % (k, a[k], b[k])
+assert b["gpu_bus"] == "0000:01:00.0", b["gpu_bus"]
+PY
+check_eq "gpu (valid): cached identity fields match the fresh parse" "0" "$?"
+
+# --- scenario 1b: fields nvidia-smi can't report ----------------------------
+STUB_NA=$(make_stub na ' [N/A], 512, 8192, 41, [Not Supported], [N/A], 300, 0, 0\n' "$XML_VALID")
+run_collect "$STUB_NA" na
+python3 - "$T/na/out.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["gpu_pct"] == 0 and d["gpu_power_w"] == 0 and d["gpu_fan_pct"] == 0, d
+assert d["gpu_mem_mb"] == 512 and d["gpu_temp"] == 41, d
+PY
+check_eq "gpu (n/a): unsupported fields read as 0, JSON stays valid" "0" "$?"
+
 # --- scenario 2: nvidia-smi present but silent/empty -------------------------
 run_collect "$STUB_EMPTY" empty
 python3 - "$T/empty/out.json" <<'PY'

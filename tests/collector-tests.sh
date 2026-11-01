@@ -137,6 +137,32 @@ check_eq "collect: app_exit logged for a vanished app" "1" \
 check_eq "collect: no app_exit for a still-running process" "0" \
   "$(q "$OMCONTROL_DB" "SELECT count(*) FROM events WHERE type='app_exit' AND app='$PID1_NAME';")"
 
+# New-app detection: a name is a candidate on its first tick and a new app
+# on the next tick it is still running, exactly once. A throwaway copy of
+# sleep under a unique 15-character name is the subject.
+cp "$(command -v sleep)" "$T/omc-newapp-test"
+"$T/omc-newapp-test" 60 &
+NEWAPP_PID=$!
+sleep 0.2
+run_interp "$ROOT/backend/collect.sh" >"$T/na1.json" 2>/dev/null
+run_interp "$ROOT/backend/collect.sh" >"$T/na2.json" 2>/dev/null
+run_interp "$ROOT/backend/collect.sh" >"$T/na3.json" 2>/dev/null
+kill "$NEWAPP_PID" 2>/dev/null
+wait "$NEWAPP_PID" 2>/dev/null
+python3 - "$T" <<'PY'
+import json, os, sys
+t = sys.argv[1]
+names = lambda f: [a["name"] for a in json.load(open(os.path.join(t, f)))["new_apps"]]
+lines = lambda f: open(os.path.join(t, f)).read().split("\n")
+n = "omc-newapp-test"
+assert n not in names("na1.json"), "promoted on first sight"
+assert n in names("na2.json"), "not promoted on second sight"
+assert n not in names("na3.json"), "promoted twice"
+assert n in lines("apps_seen") and n not in lines("apps_cand"), "seen/cand lists"
+assert sum(1 for l in lines("new_apps.log") if l.endswith(" " + n)) == 1, "new_apps.log"
+PY
+check_eq "collect: new app promoted once, on its second tick" "0" "$?"
+
 # Transients are named with a `.<name>.$$` PID suffix, so any remaining file
 # whose basename ends in a digit is an uncleaned temp. mindepth 1 keeps the
 # temp dir itself (mktemp's random suffix can end in a digit) out of the scan.

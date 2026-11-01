@@ -69,6 +69,14 @@ schema_repair() {
   DB="$1"
   DATA_DIR="${2:-$OMCONTROL_DATA_DIR}"
 
+  # Fast path, every tick: version, objects and columns in ONE sqlite3 call.
+  # Anything short of a complete, current schema takes the full repair below.
+  SCHEMA_STATE=$(sqlite3 -cmd ".timeout 1500" "$DB" "SELECT (SELECT user_version FROM pragma_user_version), (SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ($REQUIRED_BASE_TABLES)) + (SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ($REQUIRED_BASE_INDEXES) AND sql IS NOT NULL), (SELECT count(*) FROM pragma_table_info('metrics') WHERE name IN ($REQUIRED_METRICS_COLS));" 2>/dev/null)
+  if [ "$SCHEMA_STATE" = "$SCHEMA_VERSION|7|6" ] && [ -f "$DATA_DIR/.omc_wal_on" ] &&
+    [ ! -e "${DB}.schema_mark_v4" ]; then
+    return 0
+  fi
+
   SCHEMA_UV=$(sqlite3 -cmd ".timeout 1500" "$DB" "PRAGMA user_version;" 2>/dev/null)
   if [ -z "$SCHEMA_UV" ]; then
     SCHEMA_UV=0

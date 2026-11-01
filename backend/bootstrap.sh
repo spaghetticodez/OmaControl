@@ -21,7 +21,26 @@ unset LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH LD_LIBRARY_PATH_64 \
 
 : "${OMCONTROL_DATA_DIR:=$HOME/.local/share/omcontrol}"
 export OMCONTROL_DATA_DIR
-mkdir -p "$OMCONTROL_DATA_DIR" 2>/dev/null || true
+# Every helper sources this on every tick: only fork mkdir when needed.
+[ -d "$OMCONTROL_DATA_DIR" ] || mkdir -p "$OMCONTROL_DATA_DIR" 2>/dev/null || true
+
+# Tick-to-tick state (rewritten every tick, meaningless after a reboot) lives
+# on tmpfs: $XDG_RUNTIME_DIR/omcontrol, else /run/user/<uid>/omcontrol, else
+# the data dir. OMCONTROL_RUN_DIR overrides (tests). Call when needed; it
+# only forks when the directory has to be created.
+omc_run_dir() {
+  if [ -z "${OMCONTROL_RUN_DIR:-}" ]; then
+    OMCONTROL_RUN_DIR="$OMCONTROL_DATA_DIR"
+    _rt="${XDG_RUNTIME_DIR:-}"
+    [ -n "$_rt" ] || _rt="/run/user/$(id -u)"
+    [ -d "$_rt" ] && [ -w "$_rt" ] && OMCONTROL_RUN_DIR="$_rt/omcontrol"
+  fi
+  if [ ! -d "$OMCONTROL_RUN_DIR" ]; then
+    mkdir -p "$OMCONTROL_RUN_DIR" 2>/dev/null && chmod 700 "$OMCONTROL_RUN_DIR" 2>/dev/null
+  fi
+  [ -d "$OMCONTROL_RUN_DIR" ] && [ -w "$OMCONTROL_RUN_DIR" ] || OMCONTROL_RUN_DIR="$OMCONTROL_DATA_DIR"
+  export OMCONTROL_RUN_DIR
+}
 
 # Hard ceiling for any helper's stdout, applied by run-capped.sh and by the
 # producers themselves. Payloads are element-bounded (fixed count/window

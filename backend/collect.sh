@@ -12,11 +12,11 @@ DATA_DIR="$OMCONTROL_DATA_DIR"
 DB="${OMCONTROL_DB:-$DATA_DIR/history.db}"
 NOW=$(/usr/bin/date +%s)
 
-# Prune stale temp files from past invocations that got killed mid-run.
-find "$DATA_DIR" -maxdepth 1 -mmin +30 \
-  \( -name '.omc_*' -o -name '.cur_names.*' -o -name '.cur_names_min.*' \
-  -o -name '.new_names.*' -o -name '.promote.*' -o -name '.fresh.*' \
-  -o -name '.seen.*' \) -delete 2>/dev/null
+# Per-tick cost: this runs every 2-5 s for as long as the shell runs, so
+# values are read with the shell's own `read` wherever possible and every
+# external command is one pass over its input. Values that only change at
+# boot (CPU model, kernel, ...) and the parsed GPU dump are cached in the
+# run dir.
 
 # Single-collector guard: BarWidget spawns collect.sh every 2s AND the
 # omcontrol-collect service runs it on the same cadence. Only one may run
@@ -32,6 +32,25 @@ flock -n 9 2>/dev/null || exit 0
 # never break the stdout blob.
 esc() {
   printf '%s' "$1" | tr -d '\000-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+NL='
+'
+
+# num VALUE -> VALUE without surrounding spaces in _n if it is a plain
+# non-negative number, else 0. Values go into the JSON and SQL unquoted.
+num() {
+  _n=$1
+  _n=${_n#"${_n%%[! ]*}"}
+  _n=${_n%"${_n##*[! ]}"}
+  case "$_n" in '' | .* | *. | *.*.* | *[!0-9.]*) _n=0 ;; esac
+}
+
+# rd FILE -> its first line in _v ("" when unreadable), without a fork.
+rd() {
+  _v=""
+  [ -r "$1" ] && IFS= read -r _v <"$1"
+  :
 }
 
 # --- Toast notifications are fired from sql-ins.py (single choke point),
@@ -52,23 +71,16 @@ DS_PRE="$D/.omc_disk_pre.$$"
 DS_POST="$D/.omc_disk_post.$$"
 NET_CUR="$D/.omc_net_cur.$$"
 DISKIO="$D/.omc_diskio.$$"
-DF_FILE="$D/.omc_df.$$"
 PS_FILE="$D/.omc_ps.$$"
 PROC_IO_RATE="$D/.omc_proc_io_rate.$$"
 PROC_SWAP="$D/.omc_proc_swap.$$"
-TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $DISKIO $DF_FILE $PS_FILE $PROC_IO_RATE $PROC_SWAP $DATA_DIR/.cur_names.$$ $DATA_DIR/.cur_names_min.$$ $DATA_DIR/.new_names.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.fresh.$$ $DATA_DIR/.seen.$$ $DATA_DIR/.seen.sorted.$$ $DATA_DIR/.cand.sorted.$$"
+TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $DISKIO $PS_FILE $PROC_IO_RATE $PROC_SWAP $DATA_DIR/.cur_names_min.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.seen.$$"
 trap 'rm -f -- $TMPFILES' EXIT INT TERM
 
 # --- Tick-to-tick sampling state. Rewritten every tick and meaningless after
 #     a reboot, so it lives on tmpfs (/run/user/<uid>) when available instead
 #     of wearing the disk; OMCONTROL_RUN_DIR overrides (tests). ---
-if [ -z "${OMCONTROL_RUN_DIR:-}" ]; then
-  OMCONTROL_RUN_DIR="$DATA_DIR"
-  RT="/run/user/$(id -u)"
-  [ -d "$RT" ] && [ -w "$RT" ] && OMCONTROL_RUN_DIR="$RT/omcontrol"
-fi
-mkdir -p "$OMCONTROL_RUN_DIR" 2>/dev/null && chmod 700 "$OMCONTROL_RUN_DIR" 2>/dev/null
-[ -d "$OMCONTROL_RUN_DIR" ] && [ -w "$OMCONTROL_RUN_DIR" ] || OMCONTROL_RUN_DIR="$DATA_DIR"
+omc_run_dir
 RUN="$OMCONTROL_RUN_DIR"
 NET_STATE_NEW="$RUN/net.state.new.$$"
 TMPFILES="$TMPFILES $NET_STATE_NEW"
@@ -76,9 +88,9 @@ TMPFILES="$TMPFILES $NET_STATE_NEW"
 # --- Top 20 processes by live CPU (+ per-process storage I/O rate) ---
 # proc-sample.py measures CPU-time deltas since the previous tick, like top.
 # ps's pcpu would be a lifetime average (CPU time / process age). pcpu is
-# thread-summed and can exceed 100% (300% = 3 cores of work); divide by the
-# core count so every surface reports average CPU across cores instead.
-NCORES=$(nproc 2>/dev/null || echo 1)
+# thread-summed and can exceed 100% (300% = 3 cores of work); it is divided
+# by the core count (NCORES, counted from /proc/stat below) so every surface
+# reports average CPU across cores instead.
 python3 "$SELF_DIR/proc-sample.py" "$RUN/proc.state" "$PROC_IO_RATE" 20 >"$PS_FILE" 2>/dev/null
 [ -f "$PROC_IO_RATE" ] || : >"$PROC_IO_RATE"
 
@@ -127,28 +139,21 @@ awk -v ms="$ELAPSED_MS" 'NR==FNR { r[$1]=$2; w[$1]=$3; next }
     if (dr<0) dr=0; if (dw<0) dw=0;
     printf "%s %.1f %.1f\n", $1, dr, dw }' "$DS_BASE" "$DS_POST" >"$DISKIO"
 
-# --- Aggregate CPU usage ---
-set -- $(awk '$1=="cpu"{print $2,$3}' "$CPU_BASE")
-PREV_IDLE=$1
-PREV_TOTAL=$2
-set -- $(awk '$1=="cpu"{print $2,$3}' "$CPU_POST")
-CURR_IDLE=$1
-CURR_TOTAL=$2
-IDLE_DIFF=$((CURR_IDLE - PREV_IDLE))
-TOTAL_DIFF=$((CURR_TOTAL - PREV_TOTAL))
-if [ "$TOTAL_DIFF" -gt 0 ]; then
-  CPU_PCT=$(awk "BEGIN{printf \"%.1f\", (1 - $IDLE_DIFF / $TOTAL_DIFF) * 100}")
-else
-  CPU_PCT="0.0"
-fi
-
-# --- Per-core CPU ---
-CORES_LIST=$(awk 'NR==FNR { idle[$1]=$2; tot[$1]=$3; next }
-  $1 != "cpu" {
+# --- Aggregate + per-core CPU, and the core count, in one pass ---
+CPU_OUT=$(awk 'NR==FNR { idle[$1]=$2; tot[$1]=$3; next }
+  {
     i = $2 - idle[$1]; t = $3 - tot[$1];
-    if (t > 0) pct = (1 - i / t) * 100; else pct = 0;
-    printf "{\"id\":%d,\"pct\":%.1f},", $1, pct
-  }' "$CPU_BASE" "$CPU_POST")
+    if ($1 == "cpu") { pct = (t > 0) ? sprintf("%.1f", (1 - i / t) * 100) : "0.0"; next }
+    n++
+    if (t > 0) c = (1 - i / t) * 100; else c = 0;
+    cores = cores sprintf("{\"id\":%d,\"pct\":%.1f},", $1, c)
+  }
+  END { printf "%s %d %s", (pct == "" ? "0.0" : pct), n, cores }' "$CPU_BASE" "$CPU_POST")
+CPU_PCT=${CPU_OUT%% *}
+CPU_OUT=${CPU_OUT#* }
+NCORES=${CPU_OUT%% *}
+CORES_LIST=${CPU_OUT#* }
+[ "$NCORES" -gt 0 ] 2>/dev/null || NCORES=1
 if [ -n "$CORES_LIST" ]; then
   CORES="[${CORES_LIST%,}]"
 else
@@ -160,32 +165,39 @@ mv -f "$CPU_POST" "$STATE_CPU" 2>/dev/null
 mv -f "$DS_POST" "$STATE_DISK" 2>/dev/null
 echo "$T_NOW" >"$STATE_T" 2>/dev/null
 
-# --- Load average ---
-LOAD_1=$(awk '{print $1}' /proc/loadavg)
-LOAD_5=$(awk '{print $2}' /proc/loadavg)
-LOAD_15=$(awk '{print $3}' /proc/loadavg)
+# --- Load average, CPU frequency, uptime: plain reads, no forks ---
+read -r LOAD_1 LOAD_5 LOAD_15 _ </proc/loadavg
 
-# --- CPU frequency (current) ---
 CPU_HZ=""
 if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
-  CPU_HZ=$(awk '{printf "%d", $1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+  rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+  case "$_v" in '' | *[!0-9]*) ;; *) CPU_HZ=$((_v / 1000)) ;; esac
 fi
 if [ -z "$CPU_HZ" ]; then
   CPU_HZ=$(awk 'NR<=32 && $1=="cpu" && $2=="MHz" {printf "%d", $4; exit}' /proc/cpuinfo 2>/dev/null)
 fi
 CPU_HZ=${CPU_HZ:-0}
 
-# --- Uptime ---
-UPTIME_S=$(awk '{printf "%d", $1}' /proc/uptime)
+read -r _v _ </proc/uptime
+UPTIME_S=${_v%%.*}
 
-# --- Memory + swap ---
-MEM_TOTAL_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
-MEM_AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
-MEM_FREE_KB=$(awk '/^MemFree:/{print $2}' /proc/meminfo)
-MEM_BUFFERS_KB=$(awk '/^Buffers:/{print $2}' /proc/meminfo)
-MEM_CACHED_KB=$(awk '/^Cached:/{print $2}' /proc/meminfo)
-SWAP_TOTAL_KB=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
-SWAP_FREE_KB=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+# --- Memory + swap (one read loop over /proc/meminfo) ---
+MEM_TOTAL_KB=0 MEM_AVAIL_KB=0 MEM_FREE_KB=0 MEM_BUFFERS_KB=0 MEM_CACHED_KB=0
+SWAP_TOTAL_KB=0 SWAP_FREE_KB=0
+while read -r _k _v _; do
+  case "$_k" in
+    MemTotal:) MEM_TOTAL_KB=$_v ;;
+    MemFree:) MEM_FREE_KB=$_v ;;
+    MemAvailable:) MEM_AVAIL_KB=$_v ;;
+    Buffers:) MEM_BUFFERS_KB=$_v ;;
+    Cached:) MEM_CACHED_KB=$_v ;;
+    SwapTotal:) SWAP_TOTAL_KB=$_v ;;
+    SwapFree:)
+      SWAP_FREE_KB=$_v
+      break
+      ;;
+  esac
+done </proc/meminfo
 MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAIL_KB))
 MEM_USED_MB=$((MEM_USED_KB / 1024))
 MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
@@ -203,18 +215,19 @@ CPU_TEMP=""
 # expose no /sys/class/thermal zones at all.
 for hw in /sys/class/hwmon/hwmon*; do
   [ -n "$CPU_TEMP" ] && break
-  HWNAME=$(cat "$hw/name" 2>/dev/null)
-  case "$HWNAME" in
+  rd "$hw/name"
+  case "$_v" in
     k10temp | zenpower | coretemp) ;;
     *) continue ;;
   esac
   for lbl in "$hw"/temp*_label; do
     [ -f "$lbl" ] || continue
-    case "$(cat "$lbl" 2>/dev/null)" in
+    rd "$lbl"
+    case "$_v" in
       Tctl | Tdie | Package\ id\ 0)
-        RAW=$(cat "${lbl%_label}_input" 2>/dev/null)
-        if [ -n "$RAW" ]; then
-          CPU_TEMP=$((RAW / 1000))
+        rd "${lbl%_label}_input"
+        if [ -n "$_v" ]; then
+          CPU_TEMP=$((_v / 1000))
           break
         fi
         ;;
@@ -224,90 +237,91 @@ done
 # Fall back to thermal zones: x86_pkg_temp by its type file, else the first zone.
 if [ -z "$CPU_TEMP" ]; then
   for zone in /sys/class/thermal/thermal_zone*/temp; do
-    TYPE=$(cat "${zone%/temp}/type" 2>/dev/null)
-    if [ "$TYPE" = "x86_pkg_temp" ] || [ -z "$CPU_TEMP" ]; then
-      RAW=$(cat "$zone" 2>/dev/null)
-      if [ -n "$RAW" ]; then
-        CPU_TEMP=$((RAW / 1000))
+    rd "${zone%/temp}/type"
+    if [ "$_v" = "x86_pkg_temp" ] || [ -z "$CPU_TEMP" ]; then
+      rd "$zone"
+      if [ -n "$_v" ]; then
+        CPU_TEMP=$((_v / 1000))
       fi
     fi
   done
 fi
 CPU_TEMP=${CPU_TEMP:-0}
 
-# --- Disk usage (df) ---
-df -P >"$DF_FILE" 2>/dev/null
-DISKS=""
-DISK_MAX_PCT=0
-DF_DEVS=""
-DF_SEEN=""
-while read -r fs blk used avail pct mount; do
-  [ "$fs" = "Filesystem" ] && continue
-  # btrfs subvolumes and bind mounts repeat one filesystem under several
-  # mount points with identical numbers: report it once, at the first
-  # (shallowest) mount df lists.
-  case " $DF_SEEN " in *" $fs "*) continue ;; esac
-  # /dev/path → /proc/diskstats device name. LUKS/dm mounts show up as
-  # /dev/mapper/<name> in df but dm-N in diskstats, so resolve via sysfs.
-  case "$fs" in
-    /dev/mapper/*)
-      dev=""
-      for dmn_dev in /sys/class/block/dm-*/dm/name; do
-        [ -r "$dmn_dev" ] || continue
-        [ "$(cat "$dmn_dev" 2>/dev/null)" = "${fs#/dev/mapper/}" ] && {
-          dev=$(basename "${dmn_dev%/dm/name}")
-          break
-        }
-      done
-      [ -z "$dev" ] && continue
-      ;;
-    /dev/*)
-      dev=${fs#/dev/}
-      ;;
-    *) continue ;;
-  esac
-  [ "$blk" -gt 0 ] || continue
-  case "$mount" in
-    /*) ;;
-    *) continue ;;
-  esac
-  DF_SEEN="$DF_SEEN $fs"
-  DF_DEVS="$DF_DEVS $dev"
-  total_gb=$(awk "BEGIN{printf \"%.1f\", $blk/1048576}")
-  used_gb=$(awk "BEGIN{printf \"%.1f\", $used/1048576}")
-  pctv=$(awk "BEGIN{printf \"%.1f\", $used*100/$blk}")
-  set -- $(awk -v d="$dev" '$1==d{print $2, $3}' "$DISKIO")
-  rk=${1:-0}
-  wk=${2:-0}
-  DISKS="$DISKS{\"dev\":\"$(esc "$dev")\",\"mount\":\"$(esc "$mount")\",\"size_gb\":$total_gb,\"used_gb\":$used_gb,\"pct\":$pctv,\"read_kbs\":$rk,\"write_kbs\":$wk},"
-  # Report the busiest real filesystem as the overall "Disk" metric.
-  OLDIFS=$IFS
-  IFS=.
-  set -- $pctv
-  IFS=$OLDIFS
-  DISK_PCT_INT=$1
-  [ "$DISK_PCT_INT" -gt "$DISK_MAX_PCT" ] && DISK_MAX_PCT=$DISK_PCT_INT
-done <"$DF_FILE"
+# --- Disk usage (df), per-disk I/O and the totals in one awk pass ---
+# btrfs subvolumes and bind mounts repeat one filesystem under several mount
+# points with identical numbers: each is reported once, at the first
+# (shallowest) mount df lists. LUKS/dm mounts show up as /dev/mapper/<name>
+# in df but dm-N in diskstats, so that map is read from sysfs first.
+# The "Disk" metric is the total I/O rate across the df-mounted partitions
+# (summing those avoids double-counting whole-device + partition entries in
+# /proc/diskstats); without any of them in diskstats (rare), physical whole
+# devices are summed instead.
+DM_MAP=""
+for dmn_dev in /sys/class/block/dm-*/dm/name; do
+  rd "$dmn_dev"
+  [ -n "$_v" ] || continue
+  _d=${dmn_dev%/dm/name}
+  DM_MAP="$DM_MAP$_v/${_d##*/}
+"
+done
+DISK_OUT=$(df -P 2>/dev/null | OMC_DM_MAP="$DM_MAP" OMC_DISKIO="$DISKIO" awk '
+  function esc(s,   o, c, i) {
+    gsub(/[\x00-\x1F\x7F]/, "", s); o = ""
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      if (c == "\\" || c == "\"") o = o "\\"
+      o = o c
+    }
+    return o
+  }
+  BEGIN {
+    diskio = ENVIRON["OMC_DISKIO"]
+    n = split(ENVIRON["OMC_DM_MAP"], lines, "\n")
+    for (i = 1; i <= n; i++) if ((p = index(lines[i], "/")) > 1) dm[substr(lines[i], 1, p - 1)] = substr(lines[i], p + 1)
+    while ((getline l < diskio) > 0) {
+      split(l, f, " "); io[++nio] = f[1]; rr[f[1]] = f[2]; ww[f[1]] = f[3]
+    }
+    close(diskio)
+    max = 0
+  }
+  $1 == "Filesystem" || NF < 6 { next }
+  {
+    fs = $1; blk = $2; used = $3
+    m = $0
+    for (i = 0; i < 5; i++) sub(/^[ \t]*[^ \t]+[ \t]+/, "", m)
+    sub(/[ \t]+$/, "", m)
+    if (fs in seen) next
+    if (fs ~ /^\/dev\/mapper\//) { dev = dm[substr(fs, 13)]; if (dev == "") next }
+    else if (fs ~ /^\/dev\//) dev = substr(fs, 6)
+    else next
+    if (!(blk + 0 > 0) || m !~ /^\//) next
+    seen[fs] = 1; want[dev] = 1
+    pct = sprintf("%.1f", used * 100 / blk)
+    if (int(pct) > max) max = int(pct)
+    disks = disks sprintf("{\"dev\":\"%s\",\"mount\":\"%s\",\"size_gb\":%.1f,\"used_gb\":%.1f,\"pct\":%s,\"read_kbs\":%s,\"write_kbs\":%s},",
+      esc(dev), esc(m), blk / 1048576, used / 1048576, pct, (dev in rr) ? rr[dev] : 0, (dev in ww) ? ww[dev] : 0)
+  }
+  END {
+    for (i = 1; i <= nio; i++) if (io[i] in want) { r += rr[io[i]]; w += ww[io[i]]; hit = 1 }
+    if (!hit) for (i = 1; i <= nio; i++) if (io[i] !~ /^(loop|dm-|ram|zram|sr)/) { r += rr[io[i]]; w += ww[io[i]]; hit = 1 }
+    rs = hit ? sprintf("%.1f", r) : "0"; ws = hit ? sprintf("%.1f", w) : "0"
+    printf "%d %s %s %.1f %s", max, rs, ws, rs + ws, disks
+  }')
+DISK_MAX_PCT=${DISK_OUT%% *}
+DISK_OUT=${DISK_OUT#* }
+DISK_R_TOT=${DISK_OUT%% *}
+DISK_OUT=${DISK_OUT#* }
+DISK_W_TOT=${DISK_OUT%% *}
+DISK_OUT=${DISK_OUT#* }
+DISK_IO_TOT=${DISK_OUT%% *}
+DISKS=${DISK_OUT#* }
+case "$DISK_MAX_PCT" in '' | *[!0-9]*) DISK_MAX_PCT=0 DISK_R_TOT=0 DISK_W_TOT=0 DISK_IO_TOT=0 DISKS="" ;; esac
 if [ -n "$DISKS" ]; then
   DISKS="[${DISKS%,}]"
 else
   DISKS="[]"
 fi
-
-# Total disk I/O across the real filesystem devices (KB/s) → the "Disk"
-# metric is now a read/write rate, not a capacity percentage. Summing the
-# df-mounted partitions avoids double-counting whole-device + partition
-# entries that /proc/diskstats also carries.
-set -- $(awk -v devs="${DF_DEVS## }" 'BEGIN { n = split(devs, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-  { if ($1 in want) { r += $2; w += $3; hit = 1 } }
-  END { if (hit) printf "%.1f %.1f", r, w; else printf "x" }' "$DISKIO")
-if [ -z "${1:-}" ] || [ "${1:-}" = "x" ]; then
-  # No df devices in diskstats (rare): fall back to physical whole devices.
-  set -- $(awk '!/^(loop|dm-|ram|zram|sr)/ { r += $2; w += $3; hit = 1 } END { if (hit) printf "%.1f %.1f", r, w; else printf "0 0" }' "$DISKIO")
-fi
-DISK_R_TOT=${1:-0}
-DISK_W_TOT=${2:-0}
-DISK_IO_TOT=$(awk "BEGIN{printf \"%.1f\", $DISK_R_TOT + $DISK_W_TOT}")
 
 # --- Network rates (KB/s). Mirrors the netspeed bar widget's reading: the
 #     delta between this tick and the last is divided by the real elapsed
@@ -336,6 +350,9 @@ NETS=$(awk -v now="$NOW_MS" -v stateout="$NET_STATE_NEW" 'NR==FNR {
       }
     }
     END {
+      # Cumulative rx/tx bytes across the same real interfaces (history rolls).
+      for (i = 1; i <= n; i++) { trx += rx[order[i]]; ttx += tx[order[i]] }
+      printf "%.0f %.0f\n", trx, ttx
       for (i = 1; i <= n; i++) {
         nm = order[i]
         if (!(nm in srx)) { srx[nm] = 0; stx[nm] = 0 }
@@ -347,20 +364,20 @@ NETS=$(awk -v now="$NOW_MS" -v stateout="$NET_STATE_NEW" 'NR==FNR {
     }' "$NET_CUR" "$NET_STATE")
 
 mv "$NET_STATE_NEW" "$NET_STATE"
+# First line: the cumulative totals; the rest: the per-interface JSON.
+NET_TOT_RX=${NETS%%[!0-9]*}
+NETS=${NETS#"$NET_TOT_RX"}
+NETS=${NETS# }
+NET_TOT_TX=${NETS%%[!0-9]*}
+NETS=${NETS#"$NET_TOT_TX"}
+NETS=${NETS#?}
+[ -z "$NET_TOT_RX" ] && NET_TOT_RX=0
+[ -z "$NET_TOT_TX" ] && NET_TOT_TX=0
 if [ -n "$NETS" ]; then
   NETS="[${NETS%,}]"
 else
   NETS="[]"
 fi
-
-# Cumulative rx/tx bytes across the same real interfaces (for history rolls).
-set -- $(awk 'NR>2 { sub(":","",$1); nm=tolower($1)
-      if (nm=="lo" || nm ~ /^docker[0-9]*/ || nm ~ /^br-/ || nm ~ /^virbr[0-9]*/ || nm ~ /^veth/ || nm ~ /^vboxnet[0-9]*/) next
-      r+=$2; t+=$10 } END{print r+0, t+0}' /proc/net/dev)
-NET_TOT_RX=$1
-NET_TOT_TX=$2
-[ -z "$NET_TOT_RX" ] && NET_TOT_RX=0
-[ -z "$NET_TOT_TX" ] && NET_TOT_TX=0
 
 # --- GPU (nvidia-smi) ---
 GPU_PCT="0"
@@ -387,53 +404,137 @@ GPU_MEM_CLOCK_MAX="0"
 # default nvidia-smi resolved through the hardened PATH. The AMD sysfs
 # fallback below remains the standby when neither produces a value.
 NVIDIA_SMI="${OMC_NVIDIA_SMI:-nvidia-smi}"
+# Per-process GPU memory (pid used_mib), from the cached XML dump; /dev/null
+# when there is none (no NVIDIA, unloaded driver, ...).
+GPU_PROC_MAP=/dev/null
 if command -v "$NVIDIA_SMI" >/dev/null 2>&1; then
-  GPU_LINE=$(timeout 10 "$NVIDIA_SMI" --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,clocks.sm,utilization.encoder,utilization.decoder --format=csv,noheader,nounits 2>/dev/null | sed 's/\[N\/A\]/0/g' | tail -1)
+  GPU_LINE=$(timeout 10 "$NVIDIA_SMI" --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,clocks.sm,utilization.encoder,utilization.decoder --format=csv,noheader,nounits 2>/dev/null)
+  # Last GPU's line; every field must be a plain number ("[N/A]",
+  # "[Not Supported]" and the like read as 0, so they can't break the JSON).
+  GPU_LINE=${GPU_LINE##*"$NL"}
   if [ -n "$GPU_LINE" ]; then
-    GPU_PCT=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$1); print $1}')
-    GPU_MEM=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$2); print $2}')
-    GPU_MEM_TOTAL=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$3); print $3}')
-    GPU_TEMP=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$4); print $4}')
-    GPU_POWER=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$5); print $5}')
-    GPU_FAN=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$6); print $6}')
-    GPU_CLOCK=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$7); print $7}')
-    GPU_ENC=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$8); print $8}')
-    GPU_DEC=$(echo "$GPU_LINE" | awk -F',' '{gsub(/ /,"",$9); print $9}')
-    # Tiered cadence: the utilization query above already ran for this tick;
-    # the full -q -x dump (identity + clocks + the process-map input) is
-    # expensive, so it's kept in a cache file refreshed at most once a minute
-    # and reused on every tick in between.
+    set -f
+    OLDIFS=$IFS
+    IFS=,
+    # shellcheck disable=SC2086 # split on commas on purpose
+    set -- $GPU_LINE
+    IFS=$OLDIFS
+    set +f
+    num "${1:-}"
+    GPU_PCT=$_n
+    num "${2:-}"
+    GPU_MEM=$_n
+    num "${3:-}"
+    GPU_MEM_TOTAL=$_n
+    num "${4:-}"
+    GPU_TEMP=$_n
+    num "${5:-}"
+    GPU_POWER=$_n
+    num "${6:-}"
+    GPU_FAN=$_n
+    num "${7:-}"
+    GPU_CLOCK=$_n
+    num "${8:-}"
+    GPU_ENC=$_n
+    num "${9:-}"
+    GPU_DEC=$_n
+    # Tiered cadence: the utilization query above runs every tick; the full
+    # -q -x dump (identity, clocks, link, the per-process table) is
+    # expensive, so it is refreshed at most once a minute and parsed once
+    # per refresh into gpu.info / gpu.procs.
     GPUXML="$RUN/gpu.xml"
-    if [ ! -f "$GPUXML" ] || [ -n "$(find "$GPUXML" -mmin +1 2>/dev/null)" ]; then
+    GPUINFO="$RUN/gpu.info"
+    rd "$RUN/gpu.t"
+    case "$_v" in '' | *[!0-9]*) _v=0 ;; esac
+    if [ ! -s "$GPUXML" ] || [ $((NOW - _v)) -gt 60 ]; then
       GPUXML_TMP="$RUN/gpu.xml.tmp.$$"
       TMPFILES="$TMPFILES $GPUXML_TMP"
       timeout 10 "$NVIDIA_SMI" -q -x 2>/dev/null >"$GPUXML_TMP"
-      [ -s "$GPUXML_TMP" ] && mv "$GPUXML_TMP" "$GPUXML"
+      if [ -s "$GPUXML_TMP" ]; then
+        mv "$GPUXML_TMP" "$GPUXML"
+        echo "$NOW" >"$RUN/gpu.t"
+        rm -f "$GPUINFO"
+      fi
     fi
-    if [ -s "$GPUXML" ]; then
-      GPU_NAME=$(sed -n '0,/<product_name>/s/.*<product_name>\([^<]*\)<\/product_name>.*/\1/p' "$GPUXML")
-      GPU_DRIVER=$(sed -n '0,/<driver_version>/s/.*<driver_version>\([^<]*\)<\/driver_version>.*/\1/p' "$GPUXML")
-      GPU_POWER_MAX=$(sed -n '0,/<max_power_limit>/s/.*<max_power_limit>\([0-9.]*\).*/\1/p' "$GPUXML")
-      GPU_LINK_GEN=$(sed -n '0,/<current_link_gen>/s/.*<current_link_gen>\([0-9]*\).*/\1/p' "$GPUXML")
-      GPU_LINK_GEN_MAX=$(sed -n '0,/<max_link_gen>/s/.*<max_link_gen>\([0-9]*\).*/\1/p' "$GPUXML")
-      GPU_LINK_WIDTH=$(sed -n '0,/<current_link_width>/s/.*<current_link_width>\([0-9]*\)x.*/\1/p' "$GPUXML")
-      GPU_LINK_WIDTH_MAX=$(sed -n '0,/<max_link_width>/s/.*<max_link_width>\([0-9]*\)x.*/\1/p' "$GPUXML")
-      GPU_BUS=$(sed -n '0,/<pci_bus_id>/s/.*<pci_bus_id>00000000:\([0-9a-f]*:[0-9a-f]*\.[0-9]*\)<\/pci_bus_id>.*/0000:\1/p' "$GPUXML")
-      # GPU_ENC stays the utilization.encoder percentage from the query above;
-      # <session_count> is a session count, not a load figure, so it must not
-      # overwrite it.
-      # Clocks: current from <clocks>, max from <max_clocks> — pull within section
-      GPU_MEM_CLOCK=$(awk '
-        /<clocks>/ {sec="cur"} /<\/clocks>/ {sec=""; next}
-        /<max_clocks>/ {sec="max"} /<\/max_clocks>/ {sec=""; next}
-        /<min_clocks>/ {sec="min"} /<\/min_clocks>/ {sec=""; next}
-        sec=="cur" && /<mem_clock>/ {gsub(/[^0-9]/,""); print; exit}' "$GPUXML")
-      GPU_MEM_CLOCK_MAX=$(awk '
-        /<max_clocks>/ {sec="max"; next} /<\/max_clocks>/ {sec=""; next}
-        sec=="max" && /<mem_clock>/ {gsub(/[^0-9]/,""); print; exit}' "$GPUXML")
-      GPU_GRAPHICS_CLOCK=$(awk '
-        /<max_clocks>/ {sec="max"; next} /<\/max_clocks>/ {sec=""; next}
-        sec=="max" && /<graphics_clock>/ {gsub(/[^0-9]/,""); print; exit}' "$GPUXML")
+    if [ -s "$GPUXML" ] && [ ! -s "$GPUINFO" ]; then
+      # One line per field, JSON-escaped; numbers default to 0. Each field
+      # is the first occurrence in the dump, like the per-field sed it
+      # replaces. Clocks: current from <clocks>, max from <max_clocks>.
+      OMC_PROCS="$RUN/gpu.procs.tmp.$$" awk '
+        function esc(s,   o, c, i) {
+          gsub(/[\x00-\x1F\x7F]/, "", s); o = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c == "\\" || c == "\"") o = o "\\"
+            o = o c
+          }
+          return o
+        }
+        # first(KEY, TAG, VALUE_RE, TAIL): value right after the first <TAG>,
+        # kept only when it is followed by the literal TAIL.
+        function first(k, t, re, tail,   s, p) {
+          if ((k in seen) || (p = index($0, "<" t ">")) == 0) return
+          seen[k] = 1
+          s = substr($0, p + length(t) + 2)
+          if (match(s, "^" re) && substr(s, RLENGTH + 1, length(tail)) == tail)
+            v[k] = substr(s, 1, RLENGTH)
+        }
+        function clk(k,   s) {
+          if (k in v) return
+          s = $0; gsub(/[^0-9]/, "", s); v[k] = s
+        }
+        BEGIN { procs = ENVIRON["OMC_PROCS"]; printf "" > procs }
+        {
+          first("name", "product_name", "[^<]*", "</product_name>")
+          first("driver", "driver_version", "[^<]*", "</driver_version>")
+          first("pmax", "max_power_limit", "[0-9.]*", "")
+          first("gen", "current_link_gen", "[0-9]*", "")
+          first("genmax", "max_link_gen", "[0-9]*", "")
+          first("width", "current_link_width", "[0-9]*", "x")
+          first("widthmax", "max_link_width", "[0-9]*", "x")
+          first("bus", "pci_bus_id", "00000000:[0-9a-f]*:[0-9a-f]*\\.[0-9]*", "</pci_bus_id>")
+        }
+        /<clocks>/ { sec = "cur" }
+        /<max_clocks>/ { sec = "max" }
+        /<min_clocks>/ { sec = "min" }
+        /<\/clocks>/ || /<\/max_clocks>/ || /<\/min_clocks>/ { sec = ""; next }
+        sec == "cur" && /<mem_clock>/ { clk("mclk") }
+        sec == "max" && /<mem_clock>/ { clk("mclkmax") }
+        sec == "max" && /<graphics_clock>/ { clk("gclkmax") }
+        /<process_info>/ { inproc = 1 }
+        inproc && /<pid>/ { s = $0; gsub(/[^0-9]/, "", s); pid = s }
+        inproc && /<used_memory>/ {
+          s = $0; gsub(/[^0-9]/, "", s)
+          if (pid != "") print pid, s > procs
+          inproc = 0
+        }
+        END {
+          if (v["pmax"] !~ /^[0-9]+(\.[0-9]+)?$/) v["pmax"] = 0
+          if ("bus" in v) v["bus"] = "0000:" substr(v["bus"], 10)
+          print esc(v["name"]); print esc(v["driver"]); print v["pmax"]
+          print v["gen"]; print v["genmax"]; print v["width"]; print v["widthmax"]
+          print v["bus"]; print v["mclk"] + 0; print v["mclkmax"] + 0; print v["gclkmax"] + 0
+        }' "$GPUXML" >"$GPUINFO.tmp.$$" &&
+        mv "$GPUINFO.tmp.$$" "$GPUINFO" && mv "$RUN/gpu.procs.tmp.$$" "$RUN/gpu.procs"
+      rm -f "$GPUINFO.tmp.$$" "$RUN/gpu.procs.tmp.$$"
+    fi
+    if [ -s "$GPUINFO" ]; then
+      {
+        IFS= read -r GPU_NAME
+        IFS= read -r GPU_DRIVER
+        read -r GPU_POWER_MAX
+        read -r GPU_LINK_GEN
+        read -r GPU_LINK_GEN_MAX
+        read -r GPU_LINK_WIDTH
+        read -r GPU_LINK_WIDTH_MAX
+        read -r GPU_BUS
+        read -r GPU_MEM_CLOCK
+        read -r GPU_MEM_CLOCK_MAX
+        read -r GPU_GRAPHICS_CLOCK
+      } <"$GPUINFO"
+      # GPU_ENC stays the utilization.encoder percentage from the query
+      # above; <session_count> is a session count, not a load figure.
+      [ -s "$RUN/gpu.procs" ] && GPU_PROC_MAP="$RUN/gpu.procs"
     fi
   fi
 fi
@@ -444,92 +545,105 @@ fi
 if [ -z "$GPU_NAME" ]; then
   for ADEV in /sys/class/drm/card*/device; do
     [ -r "$ADEV/gpu_busy_percent" ] || continue
-    GPU_PCT=$(cat "$ADEV/gpu_busy_percent" 2>/dev/null)
-    GPU_PCT=${GPU_PCT:-0}
+    rd "$ADEV/gpu_busy_percent"
+    num "$_v"
+    GPU_PCT=$_n
     GPU_NAME="AMD GPU"
     GPU_DRIVER="amdgpu"
     if [ -r "$ADEV/mem_info_vram_used" ]; then
-      V=$(cat "$ADEV/mem_info_vram_used" 2>/dev/null)
-      [ -n "$V" ] || V=0
-      GPU_MEM=$((V / 1048576))
+      rd "$ADEV/mem_info_vram_used"
+      [ -n "$_v" ] || _v=0
+      GPU_MEM=$((_v / 1048576))
     fi
     if [ -r "$ADEV/mem_info_vram_total" ]; then
-      V=$(cat "$ADEV/mem_info_vram_total" 2>/dev/null)
-      [ -n "$V" ] || V=0
-      GPU_MEM_TOTAL=$((V / 1048576))
+      rd "$ADEV/mem_info_vram_total"
+      [ -n "$_v" ] || _v=0
+      GPU_MEM_TOTAL=$((_v / 1048576))
     fi
     for hw in /sys/class/hwmon/hwmon*; do
-      [ -r "$hw/name" ] || continue
-      [ "$(cat "$hw/name" 2>/dev/null)" = "amdgpu" ] || continue
-      T=$(cat "$hw/temp1_input" 2>/dev/null)
-      [ -n "$T" ] && GPU_TEMP=$((T / 1000))
+      rd "$hw/name"
+      [ "$_v" = "amdgpu" ] || continue
+      rd "$hw/temp1_input"
+      [ -n "$_v" ] && GPU_TEMP=$((_v / 1000))
       break
     done
     break
   done
 fi
 
-# --- CPU identity ---
-CPU_NAME=$(sed -n 's/^model name[[:space:]]*: *//p' /proc/cpuinfo | head -1 | tr -d '\r')
-CPU_THREADS=$(grep -m1 '^siblings' /proc/cpuinfo | awk '{print $3}' 2>/dev/null)
-CPU_CORES=$(grep -m1 '^cpu cores' /proc/cpuinfo | awk '{print $4}' 2>/dev/null)
-CPU_MAX_MHZ=$(awk '{printf "%d", $1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)
+# --- CPU + system identity. Fixed until a reboot (the run dir is tmpfs) or
+#     a hostname change, so it is gathered and JSON-escaped once and cached.
+rd /proc/sys/kernel/hostname
+HOST=$_v
+rd /proc/sys/kernel/osrelease
+KERNEL=$_v
+IDENT="$RUN/identity"
+IDENT_KEY="$HOST|$KERNEL"
+IDENT_OK=""
+if [ -s "$IDENT" ]; then
+  {
+    IFS= read -r _k
+    IFS= read -r CPU_NAME
+    read -r CPU_THREADS
+    read -r CPU_CORES
+    read -r CPU_MAX_MHZ
+    IFS= read -r HOST_J
+    IFS= read -r KERNEL_J
+    IFS= read -r OS_PRETTY
+  } <"$IDENT"
+  [ "$_k" = "$IDENT_KEY" ] && IDENT_OK=1
+fi
+if [ -z "$IDENT_OK" ]; then
+  CPU_NAME=$(sed -n 's/^model name[[:space:]]*: *//p' /proc/cpuinfo | head -1 | tr -d '\r')
+  CPU_THREADS=$(grep -m1 '^siblings' /proc/cpuinfo | awk '{print $3}' 2>/dev/null)
+  CPU_CORES=$(grep -m1 '^cpu cores' /proc/cpuinfo | awk '{print $4}' 2>/dev/null)
+  rd /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+  num "$_v"
+  CPU_MAX_MHZ=$((${_n%%.*} / 1000))
+  num "$CPU_THREADS"
+  CPU_THREADS=${_n%%.*}
+  num "$CPU_CORES"
+  CPU_CORES=${_n%%.*}
+  OS_PRETTY=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -1)
+  CPU_NAME=$(esc "$CPU_NAME")
+  HOST_J=$(esc "$HOST")
+  KERNEL_J=$(esc "$KERNEL")
+  OS_PRETTY=$(esc "$OS_PRETTY")
+  printf '%s\n' "$IDENT_KEY" "$CPU_NAME" "$CPU_THREADS" "$CPU_CORES" "$CPU_MAX_MHZ" \
+    "$HOST_J" "$KERNEL_J" "$OS_PRETTY" >"$IDENT" 2>/dev/null
+fi
 
-# --- Battery ---
+# --- Battery (fields read from uevent, no forks without a battery) ---
 BAT_PRESENT=0
 BAT_PCT=0
 BAT_STATUS=""
 BAT_POWER_W=0
 BAT_MODEL=""
 for f in /sys/class/power_supply/BAT*/uevent; do
-  [ -e "$f" ] || continue
+  [ -r "$f" ] || continue
   BAT_PRESENT=1
-  BAT_PCT=$(grep -m1 '^POWER_SUPPLY_CAPACITY=' "$f" | cut -d= -f2)
-  BAT_STATUS=$(grep -m1 '^POWER_SUPPLY_STATUS=' "$f" | cut -d= -f2)
-  BAT_POWER=$(grep -m1 '^POWER_SUPPLY_POWER_NOW=' "$f" | cut -d= -f2)
-  BAT_MODEL=$(grep -m1 '^POWER_SUPPLY_MODEL_NAME=' "$f" | cut -d= -f2)
+  BAT_POWER=""
+  while IFS='=' read -r _k _v; do
+    case "$_k" in
+      POWER_SUPPLY_CAPACITY) BAT_PCT=$_v ;;
+      POWER_SUPPLY_STATUS) BAT_STATUS=$_v ;;
+      POWER_SUPPLY_POWER_NOW) BAT_POWER=$_v ;;
+      POWER_SUPPLY_MODEL_NAME) BAT_MODEL=$_v ;;
+    esac
+  done <"$f"
+  case "$BAT_PCT" in '' | *[!0-9]*) BAT_PCT=0 ;; esac
+  case "$BAT_POWER" in
+    '' | *[!0-9]*) ;;
+    *) BAT_POWER_W=$(awk "BEGIN{printf \"%.1f\", $BAT_POWER/1000000}") ;;
+  esac
+  BAT_STATUS=$(esc "$BAT_STATUS")
+  BAT_MODEL=$(esc "$BAT_MODEL")
   break
 done
-BAT_PCT=$(echo "$BAT_PCT" | tr -cd '0-9')
-[ -z "$BAT_PCT" ] && BAT_PCT=0
-BAT_POWER=$(echo "$BAT_POWER" | tr -cd '0-9')
-if [ -n "$BAT_POWER" ]; then
-  BAT_POWER_W=$(awk "BEGIN{printf \"%.1f\", $BAT_POWER/1000000}")
-fi
-BAT_POWER_W=${BAT_POWER_W:-0}
-
-# --- System identity ---
-HOST=$(hostname)
-KERNEL=$(uname -r)
-OS_PRETTY=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -1)
 
 # --- Process count ---
-PROC_COUNT=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
-
-# --- Top 20 processes by CPU (with per-process GPU memory % if available) ---
-GPU_PROC_MAP="$D/.omc_gpu_proc.$$"
-TMPFILES="$TMPFILES $GPU_PROC_MAP"
-# Always create the file: the merged PROCS awk below reads it, and it stays
-# empty whenever the driver produced no XML (no NVIDIA, unloaded driver, …).
-: >"$GPU_PROC_MAP"
-# nvidia-smi only lists compute contexts via --query-compute-apps (usually
-# empty), so parse the XML process table which includes graphical processes.
-# Reuses the cached once-per-minute -q -x dump from the GPU block above; no
-# extra nvidia-smi call here.
-if command -v nvidia-smi >/dev/null 2>&1; then
-  if [ -z "$GPUXML" ]; then
-    GPUXML="$RUN/gpu.xml"
-  fi
-  [ -s "$GPUXML" ] && awk '
-    /<process_info>/ { inproc=1 }
-    inproc && /<pid>/ { gsub(/[^0-9]/, "", $0); pidname=$0 }
-    inproc && /<used_memory>/ {
-      gsub(/[^0-9]/, "", $0); mem=$0
-      if (pidname != "") { print pidname, mem }
-      inproc=0
-    }
-  ' "$GPUXML" >"$GPU_PROC_MAP"
-fi
+set -- /proc/[0-9]*
+PROC_COUNT=$#
 
 # --- Per-process disk I/O rate (KB/s) comes from proc-sample.py above. ---
 
@@ -577,9 +691,15 @@ SQL
 # --- Persist per-process snapshot once per minute (chart drill-down) + refresh
 #     app metadata (publisher/verified/desc; cached in app_meta) ---
 PROC_MIN=$((NOW / 60))
-LAST_PROCMIN=$(cat "$DATA_DIR/.omc_proc_min" 2>/dev/null || echo 0)
-if [ "$PROC_MIN" -gt "$LAST_PROCMIN" ]; then
+rd "$DATA_DIR/.omc_proc_min"
+case "$_v" in '' | *[!0-9]*) _v=0 ;; esac
+if [ "$PROC_MIN" -gt "$_v" ]; then
   PROC_TS=$((PROC_MIN * 60))
+  # Prune stale temp files from past invocations that got killed mid-run.
+  find "$DATA_DIR" -maxdepth 1 -mmin +30 \
+    \( -name '.omc_*' -o -name '.cur_names.*' -o -name '.cur_names_min.*' \
+    -o -name '.new_names.*' -o -name '.promote.*' -o -name '.fresh.*' \
+    -o -name '.seen.*' \) -delete 2>/dev/null
   PER_PROC_NET="1"
   if [ -f "$DATA_DIR/metrics_prefs.json" ] &&
     grep -q '"perProcNet"[[:space:]]*:[[:space:]]*\(false\|0\)' "$DATA_DIR/metrics_prefs.json" 2>/dev/null; then
@@ -594,7 +714,7 @@ if [ "$PROC_MIN" -gt "$LAST_PROCMIN" ]; then
   NETPROCS_FILE="$D/.omc_netprocs.$$"
   TMPFILES="$TMPFILES $NETPROCS_FILE"
   if [ "$PER_PROC_NET" = "1" ]; then
-    OMCONTROL_DATA_DIR="$DATA_DIR" python3 "$(dirname "$0")/net-procs.py" >"$NETPROCS_FILE" 2>/dev/null
+    OMCONTROL_DATA_DIR="$DATA_DIR" python3 "$SELF_DIR/net-procs.py" >"$NETPROCS_FILE" 2>/dev/null
   else
     : >"$NETPROCS_FILE"
   fi
@@ -640,7 +760,7 @@ PY
   )
   PROC_JSON_SQL=$(echo "$PROC_JSON" | sed "s/'/''/g")
   sqlite3 -cmd ".timeout 1500" "$DB" "INSERT OR REPLACE INTO proc_history VALUES ($PROC_TS, '$PROC_JSON_SQL');" 2>/dev/null
-  awk '{print $1, $4}' "$PS_FILE" | OMCONTROL_DB="$DB" python3 "$(dirname "$0")/app-meta.py" 2>/dev/null
+  awk '{print $1, $4}' "$PS_FILE" | OMCONTROL_DB="$DB" python3 "$SELF_DIR/app-meta.py" 2>/dev/null
   # App-exit events: names in last minute's snapshot that are gone now
   # (only "real" apps: resolved to a package/core, never ephemeral shells
   # or churning kernel worker threads).
@@ -650,9 +770,10 @@ PY
   if [ -f "$DATA_DIR/.last_names_min" ]; then
     # Both lists are sort -u output under LC_ALL=C, so comm finds the exits
     # in one pass instead of one grep per name.
-    comm -23 "$DATA_DIR/.last_names_min" "$DATA_DIR/.cur_names_min.$$" | tr -d '\r' |
-      awk -v ts="$PROC_TS" 'NF { printf "event\t%s\tapp_exit\t%s\t\tApp closed: %s\t1\n", ts, $0, $0 }' |
-      OMCONTROL_DB="$DB" python3 "$(dirname "$0")/sql-ins.py" 2>/dev/null
+    # sql-ins.py (a python start) only runs when something actually exited.
+    EXITS=$(comm -23 "$DATA_DIR/.last_names_min" "$DATA_DIR/.cur_names_min.$$" |
+      awk -v ts="$PROC_TS" '{ sub(/\r+$/, "") } NF { printf "event\t%s\tapp_exit\t%s\t\tApp closed: %s\t1\n", ts, $0, $0 }')
+    [ -n "$EXITS" ] && printf '%s\n' "$EXITS" | OMCONTROL_DB="$DB" python3 "$SELF_DIR/sql-ins.py" 2>/dev/null
   fi
   mv "$DATA_DIR/.cur_names_min.$$" "$DATA_DIR/.last_names_min"
   echo "$PROC_MIN" >"$DATA_DIR/.omc_proc_min"
@@ -664,43 +785,60 @@ fi
 #     via sample-json.sh (cached on disk), so nothing here queries the table.
 
 # --- New-app detection ---
+# A name is a candidate the first tick it is seen and becomes a new app the
+# next tick it is still running (so one-shot helpers don't count). Set
+# lookups in awk replace the sort/comm passes over the seen and candidate
+# lists, and the seen list is only rewritten when something was promoted.
 SEEN_FILE="$DATA_DIR/apps_seen"
 CAND_FILE="$DATA_DIR/apps_cand"
 NEWAPPS_LOG="$DATA_DIR/new_apps.log"
-touch "$SEEN_FILE" "$CAND_FILE" "$NEWAPPS_LOG"
+: >>"$SEEN_FILE"
+: >>"$CAND_FILE"
+: >>"$NEWAPPS_LOG"
+PROMOTE="$DATA_DIR/.promote.$$"
 
 # Userspace processes only: kernel threads are kthreadd (pid 2) and its
 # children, zombies have no cmdline. One ps call, no per-process forks.
-ps -eo pid=,ppid=,stat=,comm= 2>/dev/null | while read -r pid ppid st name; do
-  [ -z "$name" ] && continue
-  [ "$pid" = 2 ] || [ "$ppid" = 2 ] && continue
-  case "$st" in Z*) continue ;; esac
-  case "$name" in \[*\]) continue ;; esac
-  echo "$name"
-done |
-  grep -vE '^(sh|bash|zsh|dash|fish|ps|pgrep|grep|awk|sed|sleep|cat|head|tail|true|false|tee|sort|uniq|comm|notify-send|omarchy-notification-send|xargs|find|rm|cp|mv|mkdir|dirname|basename|timeout|kworker.*|kthreadd|ksoftirqd|kswapd|kcompactd|khugepaged|kblockd|kdevtmpfs|khelper|writeback|jbd2|kcryptd|dmcrypt_write|oom_reaper|migration|watchdog|cpuhp|rcu|scsi_|usb_|irq/|ata_|xfs-|btrfs-|flush-|events_unbound|netns|kauditd|systemd-udevd)$' |
-  sort | uniq >"$DATA_DIR/.cur_names.$$"
-
-sort "$SEEN_FILE" >"$DATA_DIR/.seen.sorted.$$"
-sort "$CAND_FILE" >"$DATA_DIR/.cand.sorted.$$"
-comm -23 "$DATA_DIR/.cur_names.$$" "$DATA_DIR/.seen.sorted.$$" >"$DATA_DIR/.new_names.$$"
-comm -12 "$DATA_DIR/.new_names.$$" "$DATA_DIR/.cand.sorted.$$" >"$DATA_DIR/.promote.$$"
-comm -23 "$DATA_DIR/.new_names.$$" "$DATA_DIR/.cand.sorted.$$" >"$DATA_DIR/.fresh.$$"
+ps -eo pid=,ppid=,stat=,comm= 2>/dev/null | awk '
+  {
+    pid = $1; ppid = $2; st = $3
+    name = $0
+    sub(/^[ \t]*[^ \t]+[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]*/, "", name)
+    sub(/[ \t]+$/, "", name)
+  }
+  name == "" || pid == 2 || ppid == 2 || st ~ /^Z/ || name ~ /^\[.*\]$/ { next }
+  name ~ /^(sh|bash|zsh|dash|fish|ps|pgrep|grep|awk|sed|sleep|cat|head|tail|true|false|tee|sort|uniq|comm|notify-send|omarchy-notification-send|xargs|find|rm|cp|mv|mkdir|dirname|basename|timeout|kworker.*|kthreadd|ksoftirqd|kswapd|kcompactd|khugepaged|kblockd|kdevtmpfs|khelper|writeback|jbd2|kcryptd|dmcrypt_write|oom_reaper|migration|watchdog|cpuhp|rcu|scsi_|usb_|irq\/|ata_|xfs-|btrfs-|flush-|events_unbound|netns|kauditd|systemd-udevd)$/ { next }
+  { print name }' | sort -u | OMC_SEEN="$SEEN_FILE" OMC_CAND="$CAND_FILE" OMC_PROMOTE="$PROMOTE" awk '
+  BEGIN {
+    seenf = ENVIRON["OMC_SEEN"]; candf = ENVIRON["OMC_CAND"]; promote = ENVIRON["OMC_PROMOTE"]
+    while ((getline l < seenf) > 0) seen[l] = 1
+    close(seenf)
+    while ((getline l < candf) > 0) cand[l] = 1
+    close(candf)
+    printf "" > promote
+  }
+  !($0 in seen) { if ($0 in cand) print > promote; else fresh[++n] = $0 }
+  END {
+    printf "" > candf
+    for (i = 1; i <= n; i++) print fresh[i] > candf
+  }'
 
 NEW_APPS="[]"
-if [ -s "$DATA_DIR/.promote.$$" ]; then
-  NEW_APPS=$(awk '{gsub(/["\\]/, " ", $0); printf "{\"name\":\"%s\",\"first_seen\":'$NOW'}", $0; if (NR < n) printf ","}' n="$(wc -l <"$DATA_DIR/.promote.$$")" "$DATA_DIR/.promote.$$")
+if [ -s "$PROMOTE" ]; then
+  NEW_APPS=$(OMC_LOG="$NEWAPPS_LOG" awk -v now="$NOW" '
+    BEGIN { logf = ENVIRON["OMC_LOG"] }
+    { sub(/\r+$/, "") }
+    $0 != "" {
+      print now " " $0 >> logf
+      n = $0; gsub(/["\\]/, " ", n)
+      printf "%s{\"name\":\"%s\",\"first_seen\":%s}", sep, n, now; sep = ","
+    }' "$PROMOTE")
   NEW_APPS="[$NEW_APPS]"
-  while IFS= read -r nm; do
-    nm=$(echo "$nm" | tr -d '\r')
-    [ -n "$nm" ] || continue
-    echo "$NOW $nm" >>"$NEWAPPS_LOG"
-  done <"$DATA_DIR/.promote.$$"
 
   # Classify each first-seen launch via the app-meta cache: verified apps are
   # plain launches, known-but-unverified are unsigned_launch, anything without
   # a resolved publisher is an unknown_app — the Security bucket / chart pins.
-  OMCONTROL_NOW="$NOW" python3 - "$DB" "$DATA_DIR/.promote.$$" <<'PY' |
+  OMCONTROL_NOW="$NOW" python3 - "$DB" "$PROMOTE" <<'PY' |
 \
 import os, sqlite3, sys
 db = sys.argv[1]
@@ -726,17 +864,13 @@ try:
 finally:
     con.close()
 PY
-    OMCONTROL_DB="$DB" python3 "$(dirname "$0")/sql-ins.py" 2>/dev/null
-  cat "$DATA_DIR/.promote.$$" >>"$SEEN_FILE"
+    OMCONTROL_DB="$DB" python3 "$SELF_DIR/sql-ins.py" 2>/dev/null
+  cat "$PROMOTE" >>"$SEEN_FILE"
+  sort -u "$SEEN_FILE" | tail -4000 >"$DATA_DIR/.seen.$$" && mv "$DATA_DIR/.seen.$$" "$SEEN_FILE"
 fi
 
-sort -u "$SEEN_FILE" | tail -4000 >"$DATA_DIR/.seen.$$" && mv "$DATA_DIR/.seen.$$" "$SEEN_FILE"
-cp "$DATA_DIR/.fresh.$$" "$CAND_FILE"
-
-RECENT_APPS=$(tail -20 "$NEWAPPS_LOG" | tail -5 | awk '{gsub(/["\\]/, " ", $2); printf "{\"name\":\"%s\",\"ts\":%s},", $2, $1}' | sed 's/,$//')
+RECENT_APPS=$(tail -5 "$NEWAPPS_LOG" | awk '{gsub(/["\\]/, " ", $2); printf "%s{\"name\":\"%s\",\"ts\":%s}", sep, $2, $1; sep = ","}')
 [ -n "$RECENT_APPS" ] && RECENT_APPS="[$RECENT_APPS]" || RECENT_APPS="[]"
-
-rm -f "$DATA_DIR/.cur_names.$$" "$DATA_DIR/.new_names.$$" "$DATA_DIR/.promote.$$" "$DATA_DIR/.fresh.$$"
 
 # --- Active alert thresholds (profile + resolved limits), fed to the bar the
 #     same way sample-json.sh feeds the app window, so the bar bell and the
@@ -754,15 +888,18 @@ if [ -s "$TH_CACHE" ]; then
     IFS= read -r TH_L1
     IFS= read -r TH_L2
   } <"$TH_CACHE"
-  [ "$TH_CACHED_KEY" = "$TH_KEY" ] && [ -n "$TH_L1" ] && [ -n "$TH_L2" ] &&
-    THRESHOLDS_OUT=$(printf '%s\n%s' "$TH_L1" "$TH_L2")
+  [ "$TH_CACHED_KEY" = "$TH_KEY" ] && [ -n "$TH_L1" ] && [ -n "$TH_L2" ] && THRESHOLDS_OUT=1
 fi
 if [ -z "$THRESHOLDS_OUT" ]; then
   THRESHOLDS_OUT=$(OMC_BACKEND="$SELF_DIR" python3 "$SELF_DIR/omc-thresholds.py" "$PREFS" 2>/dev/null || true)
   [ -n "$THRESHOLDS_OUT" ] && printf '%s\n%s\n' "$TH_KEY" "$THRESHOLDS_OUT" >"$TH_CACHE" 2>/dev/null
+  TH_L1=${THRESHOLDS_OUT%%"$NL"*}
+  TH_L2=${THRESHOLDS_OUT#*"$NL"}
+  TH_L2=${TH_L2%%"$NL"*}
+  [ "$TH_L2" = "$THRESHOLDS_OUT" ] && TH_L2=""
 fi
-ALERT_PROFILE=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '1p')
-THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
+ALERT_PROFILE=$TH_L1
+THRESHOLDS_JSON=$TH_L2
 [ -n "$ALERT_PROFILE" ] || ALERT_PROFILE=medium
 [ -n "$THRESHOLDS_JSON" ] || THRESHOLDS_JSON='{}'
 
@@ -772,8 +909,7 @@ THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
 # Capped as a last resort: a malfunctioning producer must never be able to
 # retain unbounded output in the long-lived shell. 262 KB is far above the
 # ~10 KB this blob realistically reaches.
-{
-  cat <<ENDJSON
+/usr/bin/head -c "${OMCONTROL_MAX_OUT_BYTES:-1048576}" 2>/dev/null <<ENDJSON
 {
   "cpu_pct": $CPU_PCT,
   "cores": $CORES,
@@ -784,7 +920,7 @@ THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
   "cpu_max_mhz": $CPU_MAX_MHZ,
   "cpu_threads": ${CPU_THREADS:-0},
   "cpu_cores": ${CPU_CORES:-0},
-  "cpu_name": "$(esc "$CPU_NAME")",
+  "cpu_name": "$CPU_NAME",
   "uptime_s": $UPTIME_S,
   "mem_used_mb": $MEM_USED_MB,
   "mem_total_mb": $MEM_TOTAL_MB,
@@ -811,8 +947,8 @@ THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
   "gpu_clock_mhz": $GPU_CLOCK,
   "gpu_mem_clock_mhz": $GPU_MEM_CLOCK,
   "gpu_graphics_max_mhz": $GPU_GRAPHICS_CLOCK,
-  "gpu_name": "$(esc "$GPU_NAME")",
-  "gpu_driver": "$(esc "$GPU_DRIVER")",
+  "gpu_name": "$GPU_NAME",
+  "gpu_driver": "$GPU_DRIVER",
   "gpu_link_gen": "$GPU_LINK_GEN",
   "gpu_link_gen_max": "$GPU_LINK_GEN_MAX",
   "gpu_link_width": "$GPU_LINK_WIDTH",
@@ -824,13 +960,13 @@ THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
   "battery": {
     "present": $BAT_PRESENT,
     "percent": $BAT_PCT,
-    "status": "$(esc "$BAT_STATUS")",
+    "status": "$BAT_STATUS",
     "power_w": $BAT_POWER_W,
-    "model": "$(esc "$BAT_MODEL")"
+    "model": "$BAT_MODEL"
   },
-  "host": "$(esc "$HOST")",
-  "kernel": "$(esc "$KERNEL")",
-  "os_pretty": "$(esc "$OS_PRETTY")",
+  "host": "$HOST_J",
+  "kernel": "$KERNEL_J",
+  "os_pretty": "$OS_PRETTY",
   "proc_count": $PROC_COUNT,
   "ts": $NOW,
   "processes": [$PROCS],
@@ -840,4 +976,3 @@ THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
   "alert_thresholds": $THRESHOLDS_JSON
 }
 ENDJSON
-} | /usr/bin/head -c "${OMCONTROL_MAX_OUT_BYTES:-1048576}" 2>/dev/null
