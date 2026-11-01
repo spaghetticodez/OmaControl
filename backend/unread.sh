@@ -34,7 +34,8 @@ if [ -s "$CACHE" ]; then
   fi
 fi
 
-OUT=$(OMC_BACKEND="$BACKEND" python3 - "$DB" "$PREFS" <<'PY'
+OUT=$(
+  OMC_BACKEND="$BACKEND" python3 - "$DB" "$PREFS" <<'PY'
 import json, os, sqlite3, sys
 sys.path.insert(0, os.environ["OMC_BACKEND"])
 from omc_prefs import DEVICE_TO_SENS, KIND_TO_SENS
