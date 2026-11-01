@@ -618,12 +618,11 @@ PY
     grep -vE '^(sh|bash|zsh|dash|fish|ps|pgrep|grep|awk|sed|sleep|cat|head|tail|true|false|tee|sort|uniq|comm|notify-send|xargs|find|rm|cp|mv|mkdir|dirname|basename|logout|timeout|omcontrol-poll|sd_notify|kworker.*|kthreadd|ksoftirqd|kswapd|kcompactd|khugepaged|kblockd|kdevtmpfs|khelper|writeback|jbd2|kcryptd|dmcrypt_write|oom_reaper|migration|watchdog|cpuhp|rcu|scsi_|usb_|irq/|ata_|xfs-|btrfs-|flush-|events_unbound|netns|kauditd|\[.*\]|systemd-udevd)$' |
     sort -u >"$DATA_DIR/.cur_names_min.$$"
   if [ -f "$DATA_DIR/.last_names_min" ]; then
-    while IFS= read -r nm; do
-      [ -z "$nm" ] && continue
-      grep -qx "$nm" "$DATA_DIR/.cur_names_min.$$" && continue
-      nm=$(printf '%s' "$nm" | tr -d '\r')
-      printf 'event\t%s\tapp_exit\t%s\t\tApp closed: %s\t1\n' "$PROC_TS" "$nm" "$nm"
-    done <"$DATA_DIR/.last_names_min" | OMCONTROL_DB="$DB" python3 "$(dirname "$0")/sql-ins.py" 2>/dev/null
+    # Both lists are sort -u output under LC_ALL=C, so comm finds the exits
+    # in one pass instead of one grep per name.
+    comm -23 "$DATA_DIR/.last_names_min" "$DATA_DIR/.cur_names_min.$$" | tr -d '\r' |
+      awk -v ts="$PROC_TS" 'NF { printf "event\t%s\tapp_exit\t%s\t\tApp closed: %s\t1\n", ts, $0, $0 }' |
+      OMCONTROL_DB="$DB" python3 "$(dirname "$0")/sql-ins.py" 2>/dev/null
   fi
   mv "$DATA_DIR/.cur_names_min.$$" "$DATA_DIR/.last_names_min"
   echo "$PROC_MIN" >"$DATA_DIR/.omc_proc_min"
@@ -640,12 +639,14 @@ CAND_FILE="$DATA_DIR/apps_cand"
 NEWAPPS_LOG="$DATA_DIR/new_apps.log"
 touch "$SEEN_FILE" "$CAND_FILE" "$NEWAPPS_LOG"
 
-ps -eo pid,comm 2>/dev/null | while read -r pid name; do
+# Userspace processes only: kernel threads are kthreadd (pid 2) and its
+# children, zombies have no cmdline. One ps call, no per-process forks.
+ps -eo pid=,ppid=,stat=,comm= 2>/dev/null | while read -r pid ppid st name; do
   [ -z "$name" ] && continue
+  [ "$pid" = 2 ] || [ "$ppid" = 2 ] && continue
+  case "$st" in Z*) continue ;; esac
   case "$name" in \[*\]) continue ;; esac
-  if [ -r "/proc/$pid/cmdline" ] && [ -n "$(head -c1 "/proc/$pid/cmdline" 2>/dev/null)" ]; then
-    echo "$name"
-  fi
+  echo "$name"
 done |
   grep -vE '^(sh|bash|zsh|dash|fish|ps|pgrep|grep|awk|sed|sleep|cat|head|tail|true|false|tee|sort|uniq|comm|notify-send|omarchy-notification-send|xargs|find|rm|cp|mv|mkdir|dirname|basename|timeout|kworker.*|kthreadd|ksoftirqd|kswapd|kcompactd|khugepaged|kblockd|kdevtmpfs|khelper|writeback|jbd2|kcryptd|dmcrypt_write|oom_reaper|migration|watchdog|cpuhp|rcu|scsi_|usb_|irq/|ata_|xfs-|btrfs-|flush-|events_unbound|netns|kauditd|systemd-udevd)$' |
   sort | uniq >"$DATA_DIR/.cur_names.$$"

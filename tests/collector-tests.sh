@@ -109,6 +109,23 @@ PY
 check_eq "collect: profile change flows into emitted thresholds" "0" "$?"
 unset OMCONTROL_ALERT_PREFS
 
+# App-exit detection (per-minute block): a name from the previous minute's
+# snapshot that is gone now yields exactly one app_exit event; a name that is
+# still running (PID 1 never exits) yields none.
+PID1_NAME=$(cat /proc/1/comm 2>/dev/null)
+# app_exit rows are "known" events: sql-ins.py drops them unless app_meta has
+# a resolved publisher, so seed both names as resolved apps.
+q "$OMCONTROL_DB" "INSERT OR REPLACE INTO app_meta (name, publisher, verified, source, updated)
+  VALUES ('omc-test-gone', 'Test', 1, 'pacman', strftime('%s','now')),
+         ('$PID1_NAME', 'Test', 1, 'pacman', strftime('%s','now'));"
+printf '%s\n%s\n' "omc-test-gone" "$PID1_NAME" | LC_ALL=C sort -u >"$T/.last_names_min"
+echo 0 >"$T/.omc_proc_min"
+run_interp "$ROOT/backend/collect.sh" >/dev/null 2>"$T/out4.err"
+check_eq "collect: app_exit logged for a vanished app" "1" \
+  "$(q "$OMCONTROL_DB" "SELECT count(*) FROM events WHERE type='app_exit' AND app='omc-test-gone';")"
+check_eq "collect: no app_exit for a still-running process" "0" \
+  "$(q "$OMCONTROL_DB" "SELECT count(*) FROM events WHERE type='app_exit' AND app='$PID1_NAME';")"
+
 # Transients are named with a `.<name>.$$` PID suffix, so any remaining file
 # whose basename ends in a digit is an uncleaned temp. mindepth 1 keeps the
 # temp dir itself (mktemp's random suffix can end in a digit) out of the scan.
