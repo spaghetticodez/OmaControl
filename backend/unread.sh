@@ -6,8 +6,35 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DATA_DIR="${OMCONTROL_DATA_DIR:-$HOME/.local/share/omcontrol}"
 DB="${OMCONTROL_DB:-$DATA_DIR/history.db}"
 PREFS="${OMCONTROL_ALERT_PREFS:-$DATA_DIR/alert_prefs.json}"
-BACKEND="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-OMC_BACKEND="$BACKEND" python3 - "$DB" "$PREFS" <<'PY'
+BACKEND="$SELF_DIR"
+LASTREAD_FILE="${DB%/*}/events_lastread_ts"
+
+# The bar asks every tick, but the answer only changes with its inputs:
+# unread events per type, privacy starts since the last-read mark, the prefs
+# and this code. Key a run-dir cache on them (one read-only sqlite3 query),
+# so python only starts when one of them changed.
+omc_run_dir
+CACHE="$OMCONTROL_RUN_DIR/unread.cache"
+LR=""
+[ -r "$LASTREAD_FILE" ] && IFS= read -r LR <"$LASTREAD_FILE"
+case "$LR" in '' | *[!0-9]*) LR=0 ;; esac
+Q=$(sqlite3 -readonly -cmd ".timeout 1500" "$DB" "SELECT type, count(*) FROM events WHERE read=0 GROUP BY type; SELECT device, count(*) FROM privacy_events WHERE action='start' AND ts > $LR GROUP BY device;" 2>/dev/null)
+KEY=$({
+  printf '%s\n' "$Q"
+  cat "$PREFS" "$LASTREAD_FILE" "$SELF_DIR/unread.sh" "$SELF_DIR/omc_prefs.py" 2>/dev/null
+} | cksum)
+if [ -s "$CACHE" ]; then
+  {
+    IFS= read -r CACHED_KEY
+    IFS= read -r CACHED_OUT
+  } <"$CACHE"
+  if [ "$CACHED_KEY" = "$KEY" ] && [ -n "$CACHED_OUT" ]; then
+    printf '%s\n' "$CACHED_OUT"
+    exit 0
+  fi
+fi
+
+OUT=$(OMC_BACKEND="$BACKEND" python3 - "$DB" "$PREFS" <<'PY'
 import json, os, sqlite3, sys
 sys.path.insert(0, os.environ["OMC_BACKEND"])
 from omc_prefs import DEVICE_TO_SENS, KIND_TO_SENS
@@ -69,3 +96,8 @@ try:
 except Exception:
     print(json.dumps({"count": 0, "color": "dim"}))
 PY
+)
+printf '%s\n' "$OUT"
+case "$OUT" in
+  '{'*) printf '%s\n%s\n' "$KEY" "$OUT" >"$CACHE" 2>/dev/null ;;
+esac
