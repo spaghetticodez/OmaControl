@@ -23,6 +23,7 @@ case "$BROWSER" in
   *firefox*) CLASS="firefox" ;;
   *chrome*) CLASS="google-chrome" ;;
   *chromium*) CLASS="chromium" ;;
+  *brave-origin*) CLASS="brave-origin" ;;
   *brave*) CLASS="brave-browser" ;;
   *edge*) CLASS="microsoft-edge" ;;
   *librewolf*) CLASS="librewolf" ;;
@@ -32,7 +33,7 @@ case "$BROWSER" in
 esac
 
 if [ -z "$CLASS" ]; then
-  CLASS="(firefox|vivaldi-stable|google-chrome|chromium|brave-browser|microsoft-edge|librewolf|opera|qutebrowser|zen|zen-browser)"
+  CLASS="(firefox|vivaldi-stable|google-chrome|chromium|brave-browser|brave-origin|microsoft-edge|librewolf|opera|qutebrowser|zen|zen-browser)"
 fi
 
 i=0
