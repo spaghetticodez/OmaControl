@@ -14,6 +14,8 @@ NAME="$1"
 for d in /proc/[0-9]*; do
   [ -d "$d" ] || continue
   pid=${d#/proc/}
+  # Never PID 1, whatever it is called.
+  [ "$pid" = 1 ] && continue
   IFS= read -r comm <"$d/comm" 2>/dev/null || continue
   if [ "$comm" = "$NAME" ]; then
     echo "$pid"

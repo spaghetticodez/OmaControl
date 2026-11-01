@@ -24,6 +24,20 @@ NAME="$2"
   exit 1
 }
 
+# Session-critical processes (compositor, shell, audio, bus, portals, lock
+# screen, ...) can't be killed, paused or blocked: doing so ends the session
+# or locks the user out, and a disable rule would repeat it at every launch.
+# Resume, priority changes and removing a rule stay allowed.
+. "$SELF_DIR/protected.sh"
+case "$ACTION" in
+  kill | killall | stop | disable)
+    if is_protected "$NAME"; then
+      echo "refused: $NAME is a protected session process" >&2
+      REFUSED=1
+    fi
+    ;;
+esac
+
 log_event() {
   type="$1" msg="$2" now=""
   [ -f "$DB" ] || return 0
@@ -62,6 +76,11 @@ print("ok")
 PY
   } 9>"$RULES_FILE.lock"
 }
+
+if [ -n "${REFUSED:-}" ]; then
+  log_event "user_refused" "Refused to $ACTION $NAME: protected session process"
+  exit 2
+fi
 
 case "$ACTION" in
   kill)

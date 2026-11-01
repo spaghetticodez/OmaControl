@@ -1,0 +1,42 @@
+# Processes OmaControl must never stop, pause, kill or block: killing any of
+# them ends the desktop session, audio, the lock screen, the portals or
+# remote access. One shell glob per line (comm names are cut to 15
+# characters, so long names end in *). Read by backend/protected.sh
+# (app-action.sh) and enforce.sh; service rules are matched by unit name
+# without ".service".
+
+# init, session and login
+systemd
+systemd-*
+(sd-pam)
+init
+login
+agetty
+sshd
+sshd-*
+uwsm
+uwsm-*
+
+# compositor, shell, lock and idle
+Hyprland
+Xwayland
+quickshell
+qs
+hyprlock
+hypridle
+
+# bus, audio, portals, authentication
+dbus
+dbus-daemon
+dbus-broker
+dbus-broker-*
+pipewire
+pipewire-pulse
+wireplumber
+xdg-desktop-*
+xdg-document-*
+xdg-permission-*
+polkitd
+polkit-*
+hyprpolkitagent
+gnome-keyring-*

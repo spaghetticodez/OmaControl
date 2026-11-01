@@ -2,17 +2,39 @@
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SELF_DIR/bootstrap.sh"
 # OmaControl enforcement engine — reads rules.json and enforces persistent rules.
-# Usage: enforce.sh [--dry-run]
+# Usage: enforce.sh [--dry-run] [--apps]
 #   kind=app,     action=disable -> kill any matching process (kill-on-launch)
 #   kind=service, action=disable -> systemctl --user mask the unit (persistent)
 #   (legacy kill rules are honoured as well)
+#   --apps: kill-on-launch only (the bar runs this every tick). Service masks
+#           are persistent and left alone, and it exits at once when no rule
+#           is enabled.
+# Names in protected-names (compositor, shell, audio, bus, ...) are never
+# matched; a rule naming one is reported as an error instead.
 
 RULES_FILE="${OMCONTROL_RULES:-$HOME/.local/share/omcontrol/rules.json}"
 DATA_DIR="${OMCONTROL_DATA_DIR:-$HOME/.local/share/omcontrol}"
 DB="${OMCONTROL_DB:-$DATA_DIR/history.db}"
-NOW=$(date +%s)
 DRY_RUN=""
-[ "$1" = "--dry-run" ] && DRY_RUN=1
+APPS_ONLY=""
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --apps) APPS_ONLY=1 ;;
+  esac
+done
+
+if [ ! -f "$RULES_FILE" ]; then
+  echo '{"killed":[],"errors":[]}'
+  exit 0
+fi
+# Per-tick fast path: nothing enabled, nothing to do (a full run still has to
+# unmask services whose rule was switched off, so this is --apps only).
+if [ -n "$APPS_ONLY" ] && ! grep -q '"enabled"[[:space:]]*:[[:space:]]*true' "$RULES_FILE" 2>/dev/null; then
+  echo '{"killed":[],"errors":[]}'
+  exit 0
+fi
+NOW=$(date +%s)
 
 # Reject anything that isn't a plain user unit name: no absolute/relative paths,
 # no leading dot, no whitespace or shell metacharacters, no glob patterns, and
@@ -44,11 +66,6 @@ unmask_unit() {
   systemctl --user restart "$1" >/dev/null 2>&1
 }
 
-if [ ! -f "$RULES_FILE" ]; then
-  echo '{"killed":[],"errors":[]}'
-  exit 0
-fi
-
 KILLED=""
 ERRORS=""
 
@@ -71,72 +88,111 @@ CUR_MASKED=$(mktemp /tmp/omc_masked.XXXXXX)
 MSVC_LIST="$DATA_DIR/masked_services"
 trap 'rm -f "$TMP" "$KFILE" "$EFILE" "$LFILE" "$PFILE" "$CUR_MASKED"' EXIT INT TERM
 
-python3 - "$RULES_FILE" >"$TMP" <<'PY'
-import json, sys
+# One python pass parses the rules, applies the protected list and matches
+# app rules against /proc (comm OR the full exe basename: comm is cut to 15
+# characters). No per-process forks, so the bar can afford it every tick.
+# Deliberately no command-line matching: argv can merely mention a name.
+# Output lines: service|<unit>  protected|<pattern>  app|<pattern>|<pid>|<name>
+python3 - "$RULES_FILE" "$SELF_DIR/protected-names" "$$" "${DRY_RUN:-0}" "${APPS_ONLY:-0}" >"$TMP" <<'PY'
+import fnmatch, json, os, sys
+
+rules_path, prot_path, parent = sys.argv[1], sys.argv[2], sys.argv[3]
+dry, apps_only = sys.argv[4] == "1", sys.argv[5] == "1"
 try:
-    data = json.load(open(sys.argv[1]))
+    with open(rules_path) as f:
+        data = json.load(f)
+    rules = data.get("rules", []) if isinstance(data, dict) else []
 except Exception:
     sys.exit()
-for r in data.get("rules", []):
-    if not r.get("enabled"):
+
+# Fail closed: without a readable protected list, everything is protected.
+try:
+    with open(prot_path) as f:
+        prot = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    def protected(name):
+        return any(fnmatch.fnmatchcase(name, p) for p in prot)
+except OSError:
+    def protected(name):
+        return True
+
+def clean(s):
+    return "".join(c for c in s if c not in '|"\\' and ord(c) >= 32 and ord(c) != 127)
+
+apps = set()
+for r in rules:
+    if not isinstance(r, dict) or not r.get("enabled"):
         continue
     if r.get("action") not in ("disable", "kill"):
         continue
     pat = r.get("pattern", "")
-    kind = r.get("kind", "app")
-    if pat:
-        print(f"{kind}|{r.get('action')}|{pat}")
+    if not isinstance(pat, str) or not pat or clean(pat) != pat:
+        continue
+    if r.get("kind", "app") == "service":
+        if apps_only:
+            continue
+        unit = pat[:-8] if pat.endswith(".service") else pat
+        print(("protected|%s" if protected(unit) else "service|%s") % pat)
+    elif protected(pat):
+        print("protected|%s" % pat)
+    else:
+        apps.add(pat)
+
+if apps and not dry:
+    skip = {"1", parent, str(os.getpid()), str(os.getppid())}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or pid in skip:
+            continue
+        try:
+            with open("/proc/%s/comm" % pid) as f:
+                comm = f.read().rstrip("\n")
+        except OSError:
+            continue
+        try:
+            exe = os.path.basename(os.readlink("/proc/%s/exe" % pid))
+        except OSError:
+            exe = ""
+        hit = comm if comm in apps else (exe if exe in apps else "")
+        # Re-check the actual process: an unprotected rule name must not
+        # reach a protected process through its other name.
+        if not hit or protected(comm) or (exe and protected(exe)):
+            continue
+        print("app|%s|%s|%s" % (hit, pid, clean(exe) or "unknown"))
 PY
 
-grep -v '^$' "$TMP" | sed 's/\r$//' | while IFS='|' read -r kind action pattern; do
-  [ -z "$pattern" ] && continue
-
-  if [ "$kind" = "service" ]; then
-    # Track every unit this run asks to mask so we can un-mask the ones whose
-    # rule went away — a mask once applied must not outlive the rule.
-    if valid_unit "$pattern"; then
-      # Status before masking, surfaced in the caller's JSON so the reviewer
-      # can see exactly which unit was affected and in what state. unit-state.sh
-      # keeps this to one bare line (systemctl exits nonzero for inactive units,
-      # which would otherwise append "unknown" as a second line and embed a raw
-      # newline in the JSON).
-      STATE=$(sh "$(dirname "$0")/unit-state.sh" "$pattern")
-      if [ -z "$DRY_RUN" ]; then
-        mask_unit "$pattern"
-        echo "$pattern" >>"$CUR_MASKED"
+while IFS='|' read -r kind pattern pid name; do
+  case "$kind" in
+    service)
+      # Track every unit this run asks to mask so we can un-mask the ones whose
+      # rule went away — a mask once applied must not outlive the rule.
+      if valid_unit "$pattern"; then
+        # Status before masking, surfaced in the caller's JSON so the reviewer
+        # can see exactly which unit was affected and in what state.
+        # unit-state.sh keeps this to one bare line (systemctl exits nonzero for
+        # inactive units, which would otherwise append "unknown" as a second
+        # line and embed a raw newline in the JSON).
+        STATE=$(sh "$SELF_DIR/unit-state.sh" "$pattern")
+        if [ -z "$DRY_RUN" ]; then
+          mask_unit "$pattern"
+          echo "$pattern" >>"$CUR_MASKED"
+        fi
+        printf '%s\n' "{\"unit\":\"$pattern\",\"masked\":\"yes\",\"state\":\"$STATE\"}" >>"$KFILE"
+      else
+        printf '%s\n' "{\"unit\":\"$pattern\",\"error\":\"invalid unit name\"}" >>"$EFILE"
       fi
-      printf '%s\n' "{\"unit\":\"$pattern\",\"masked\":\"yes\",\"state\":\"$STATE\"}" >>"$KFILE"
-    else
-      printf '%s\n' "{\"unit\":\"$pattern\",\"error\":\"invalid unit name\"}" >>"$EFILE"
-    fi
-    continue
-  fi
-
-  if [ -z "$DRY_RUN" ]; then
-    # Match on comm AND the full resolved exe basename (comm is truncated to
-    # 15 chars; match-pids.sh closes that gap by also matching readlink exe).
-    # Deliberately no pgrep -f fallback: a command-line regex match can hit
-    # unrelated processes whose argv merely contains the pattern string.
-    PIDS=$(sh "$(dirname "$0")/match-pids.sh" "$pattern")
-    # Drop our own pid so a pattern that matches the enforcement tooling can
-    # never make us kill ourselves.
-    PIDS=$(echo "$PIDS" | grep -vx "$$" | sort -un)
-  else
-    PIDS=""
-  fi
-
-  for pid in $PIDS; do
-    [ -z "$pid" ] && continue
-    NAME=$(basename "$(readlink /proc/$pid/exe 2>/dev/null)" 2>/dev/null)
-    NAME=${NAME:-unknown}
-    PAT=$(printf '%s' "$pattern" | tr -d '\n\r|')
-    printf '%s|%s|%s\n' "$pid" "$(echo "$NAME" | tr -d '\n\r|')" "$PAT" >>"$PFILE"
-  done
-done
+      ;;
+    protected)
+      printf '%s\n' "{\"pattern\":\"$pattern\",\"error\":\"protected session process\"}" >>"$EFILE"
+      ;;
+    app)
+      printf '%s|%s|%s\n' "$pid" "$name" "$pattern" >>"$PFILE"
+      ;;
+  esac
+done <"$TMP"
 
 # Reap collected app-match targets with a SIGTERM grace before SIGKILL:
 # a well-behaved app exits on TERM (a user kill, a rule, whatever), and only
-# survivors after the grace get the SIGKILL. The killed set is reported once.
+# survivors after the grace get the SIGKILL. Every target is logged and
+# reported, whether TERM or KILL ended it.
 if [ -z "$DRY_RUN" ] && [ -s "$PFILE" ]; then
   while IFS='|' read -r pid name pat; do
     [ -z "$pid" ] && continue
@@ -145,8 +201,7 @@ if [ -z "$DRY_RUN" ] && [ -s "$PFILE" ]; then
   sleep 1
   while IFS='|' read -r pid name pat; do
     [ -z "$pid" ] && continue
-    [ -d "/proc/$pid" ] || continue
-    kill -KILL "$pid" 2>/dev/null
+    [ -d "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null
     log_block "$pid" "$name" "$pat"
     printf '%s\n' "{\"pid\":$pid,\"name\":\"$name\",\"pattern\":\"$pat\"}" >>"$KFILE"
   done <"$PFILE"
@@ -156,7 +211,8 @@ fi
 # persistent, so without this an enable/rule removal would never take effect.
 # Every unit here is a legitimate-name from the tracked mask list (or a prior
 # valid_unit()); unmask and return the unit to its prior lifecycle.
-if [ -z "$DRY_RUN" ] && [ -f "$MSVC_LIST" ]; then
+# --apps never looked at service rules, so it must not unmask anything.
+if [ -z "$DRY_RUN" ] && [ -z "$APPS_ONLY" ] && [ -f "$MSVC_LIST" ]; then
   if [ -s "$CUR_MASKED" ]; then
     grep -Fxvf "$CUR_MASKED" "$MSVC_LIST" | while IFS= read -r unit; do
       [ -z "$unit" ] && continue

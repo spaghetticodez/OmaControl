@@ -295,6 +295,20 @@ BarWidget {
     }
   }
 
+  // Kill-on-launch for "disable" rules, every tick. Without this a disabled
+  // app only died once and could start again freely unless the optional
+  // sampler service was running. enforce.sh --apps exits at once when no rule
+  // is enabled, never touches service masks, and refuses protected names.
+  // Blocks are logged to the Events tab, so no notification here.
+  Process {
+    id: autoEnforceProc
+    clearEnvironment: true
+    environment: root.trustedEnv
+    command: ["/usr/bin/timeout", "-k", "2", "8", "/bin/sh", root.runnerPath, "/bin/sh",
+              Qt.resolvedUrl("backend/enforce.sh").toString().replace("file://", ""), "--apps"]
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
   Process {
     id: privacyProc
     clearEnvironment: true
@@ -445,6 +459,7 @@ BarWidget {
       root.recomputePoll()
       if (!collectProc.running) root.refresh()
       if (!privacyProc.running) privacyProc.running = true
+      if (!autoEnforceProc.running && !enforceProc.running) autoEnforceProc.running = true
       if (root.barShowBell && !unreadProc.running) unreadProc.running = true
     }
   }
