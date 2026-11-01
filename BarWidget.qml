@@ -240,12 +240,23 @@ BarWidget {
   readonly property string runnerPath: Qt.resolvedUrl("backend/run-capped.sh").toString().replace("file://", "")
   readonly property string prefsPath: Qt.resolvedUrl("backend/prefs.py").toString().replace("file://", "")
   readonly property int maxOutputBytes: 1048576
-  readonly property var trustedEnv: ({
-    "PATH": "/usr/bin:/bin",
-    "HOME": Quickshell.env("HOME"),
-    "OMCONTROL_DATA_DIR": dataDir,
-    "LC_ALL": "C"
-  })
+  // The session-bus/runtime variables are passed through (only when set) so
+  // helpers can reach PipeWire (pactl), systemd --user, D-Bus (notify-send,
+  // gdbus) and Hyprland (hyprctl); they are locators, not search paths.
+  readonly property var trustedEnv: {
+    var env = {
+      "PATH": "/usr/bin:/bin",
+      "HOME": Quickshell.env("HOME"),
+      "OMCONTROL_DATA_DIR": dataDir,
+      "LC_ALL": "C"
+    }
+    var pass = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "HYPRLAND_INSTANCE_SIGNATURE"]
+    for (var i = 0; i < pass.length; i++) {
+      var v = Quickshell.env(pass[i])
+      if (v) env[pass[i]] = String(v)
+    }
+    return env
+  }
   function capText(text) {
     return typeof text === "string" && text.length > root.maxOutputBytes
       ? text.slice(0, root.maxOutputBytes) : (text || "")

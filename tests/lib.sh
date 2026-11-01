@@ -7,6 +7,10 @@
 # re-invoked with this shell so portability is actually exercised.
 : "${OMC_TEST_SH:=sh}"
 
+# Tests must never reach the live desktop session: no toasts (notify-send),
+# no hyprctl, no systemd --user or PipeWire calls against the real session.
+unset DBUS_SESSION_BUS_ADDRESS HYPRLAND_INSTANCE_SIGNATURE DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR
+
 CHECKS=0
 FAILS=0
 

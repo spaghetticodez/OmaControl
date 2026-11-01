@@ -45,12 +45,39 @@ done
 
 # Microphone via pactl (active capture streams). The real OS pid lives in
 # application.process.id (a Client: line is only a PulseAudio client index).
-pactl list source-outputs 2>/dev/null | awk '
-  /^Source Output #/ { if (pid && name) printf "microphone|%s|%s\n", pid, name; pid=""; name="" }
-  /application\.process\.id/ { gsub(/^.* = "/, ""); gsub(/"/, "", $0); pid=$0 }
-  tolower($0) ~ /application name:/ { sub(/^[^:]*: */, ""); gsub(/"/, "", $0); name=$0 }
-  END { if (pid && name) printf "microphone|%s|%s\n", pid, name }
-' >>"$TMP"
+# PipeWire's pactl prints properties as `application.name = "x"`; the older
+# `Application name:` form is still accepted. Captures of a speaker monitor
+# (screen recorders, visualizers) are not microphone use: they are marked
+# stream.capture.sink = "true" or record from a *.monitor source.
+# OMC_PACTL lets tests point at a stub; production resolves pactl on the
+# hardened PATH.
+PACTL="${OMC_PACTL:-pactl}"
+SO=$("$PACTL" list source-outputs 2>/dev/null)
+if [ -n "$SO" ]; then
+  "$PACTL" list short sources 2>/dev/null | awk -F'\t' '$2 ~ /\.monitor$/ { print $1 }' >"$TMP.mon"
+  printf '%s\n' "$SO" | awk -v monfile="$TMP.mon" '
+    function prop(line) { sub(/^[^=]*= "/, "", line); sub(/"[ \t]*$/, "", line); return line }
+    function flush(n) {
+      if (pid ~ /^[0-9]+$/ && !monitor && !(src != "" && src in mon)) {
+        n = (name != "") ? name : bin
+        gsub(/[|"\\\x00-\x1F\x7F]/, "", n)
+        if (n == "") n = "unknown"
+        printf "microphone|%s|%s\n", pid, n
+      }
+      pid = ""; name = ""; bin = ""; src = ""; monitor = 0
+    }
+    BEGIN { while ((getline l < monfile) > 0) mon[l] = 1; close(monfile) }
+    /^Source Output #/ { flush(); next }
+    /^[ \t]*Source: / { src = $2; next }
+    /application\.process\.id = / { pid = prop($0); next }
+    /application\.name = / { name = prop($0); next }
+    /application\.process\.binary = / { bin = prop($0); next }
+    /stream\.capture\.sink = "true"/ { monitor = 1; next }
+    tolower($0) ~ /^[ \t]*application name:/ { sub(/^[^:]*: */, ""); gsub(/"/, ""); name = $0; next }
+    END { flush() }
+  ' >>"$TMP"
+  rm -f "$TMP.mon"
+fi
 
 # Location service
 if systemctl --user is-active geoclue-agent >/dev/null 2>&1; then
@@ -84,13 +111,13 @@ fi
 sort -u "$TMP.sorted" >"$STATE"
 rm -f "$TMP" "$TMP.sorted" "$TMP.prev"
 
-# --- Build JSON output ---
-DEVICES=""
-while IFS='|' read -r dev pid name; do
-  ENTRY="{\"pid\":$pid,\"device\":\"$dev\",\"name\":\"$name\"}"
-  if [ -n "$DEVICES" ]; then DEVICES="$DEVICES,"; fi
-  DEVICES="$DEVICES$ENTRY"
-done <"$STATE"
+# --- Build JSON output (names stripped of quotes, backslashes and control
+#     characters so an app name can never break the document) ---
+DEVICES=$(awk -F'|' '$1 != "" && $2 ~ /^[0-9]+$/ {
+  d = $1; n = $3
+  gsub(/["\\\x00-\x1F\x7F]/, "", d); gsub(/["\\\x00-\x1F\x7F]/, "", n)
+  printf "%s{\"pid\":%s,\"device\":\"%s\",\"name\":\"%s\"}", sep, $2, d, n; sep = ","
+}' "$STATE")
 
 EVENTS=$(sqlite3 -cmd ".timeout 1500" "$DB" "
   SELECT '[' || group_concat(json_object('ts', ts, 'action', action, 'device', device, 'name', name, 'pid', pid)) || ']'
