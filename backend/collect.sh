@@ -14,14 +14,17 @@ NOW=$(/usr/bin/date +%s)
 
 # Prune stale temp files from past invocations that got killed mid-run.
 find "$DATA_DIR" -maxdepth 1 -mmin +30 \
-  \( -name '.omc_*' -o -name '.cur_names.*' -o -name '.new_names.*' \
-  -o -name '.promote.*' -o -name '.fresh.*' -o -name '.seen.*' \) -delete 2>/dev/null
+  \( -name '.omc_*' -o -name '.cur_names.*' -o -name '.cur_names_min.*' \
+  -o -name '.new_names.*' -o -name '.promote.*' -o -name '.fresh.*' \
+  -o -name '.seen.*' \) -delete 2>/dev/null
 
 # Single-collector guard: BarWidget spawns collect.sh every 2s AND the
 # omcontrol-collect service runs it on the same cadence. Only one may run
 # per tick; the loser exits quietly and BarWidget just reuses its last
 # sample (parseCollect("") falls back to the previous payload).
-exec 9>"$DATA_DIR/.omc_collect.lock" 2>/dev/null || exit 0
+# The braces scope 2>/dev/null to the open: a bare `exec 9>f 2>/dev/null`
+# would also redirect the script's own stderr for the rest of the run.
+{ exec 9>"$DATA_DIR/.omc_collect.lock"; } 2>/dev/null || exit 0
 flock -n 9 2>/dev/null || exit 0
 
 # Escape a value for embedding inside a JSON double-quoted string: backslash
@@ -48,13 +51,12 @@ CPU_POST="$D/.omc_cpu_post.$$"
 DS_PRE="$D/.omc_disk_pre.$$"
 DS_POST="$D/.omc_disk_post.$$"
 NET_CUR="$D/.omc_net_cur.$$"
-NET_STATE_NEW="$D/.omc_net_state.new.$$"
 DISKIO="$D/.omc_diskio.$$"
 DF_FILE="$D/.omc_df.$$"
 PS_FILE="$D/.omc_ps.$$"
 PROC_IO_RATE="$D/.omc_proc_io_rate.$$"
 PROC_SWAP="$D/.omc_proc_swap.$$"
-TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $NET_STATE_NEW $DISKIO $DF_FILE $PS_FILE $PROC_IO_RATE $PROC_SWAP $DATA_DIR/.cur_names.$$ $DATA_DIR/.new_names.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.fresh.$$ $DATA_DIR/.seen.$$ $DATA_DIR/.seen.sorted.$$ $DATA_DIR/.cand.sorted.$$"
+TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $DISKIO $DF_FILE $PS_FILE $PROC_IO_RATE $PROC_SWAP $DATA_DIR/.cur_names.$$ $DATA_DIR/.cur_names_min.$$ $DATA_DIR/.new_names.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.fresh.$$ $DATA_DIR/.seen.$$ $DATA_DIR/.seen.sorted.$$ $DATA_DIR/.cand.sorted.$$"
 trap 'rm -f -- $TMPFILES' EXIT INT TERM
 
 # --- Tick-to-tick sampling state. Rewritten every tick and meaningless after
@@ -68,6 +70,8 @@ fi
 mkdir -p "$OMCONTROL_RUN_DIR" 2>/dev/null && chmod 700 "$OMCONTROL_RUN_DIR" 2>/dev/null
 [ -d "$OMCONTROL_RUN_DIR" ] && [ -w "$OMCONTROL_RUN_DIR" ] || OMCONTROL_RUN_DIR="$DATA_DIR"
 RUN="$OMCONTROL_RUN_DIR"
+NET_STATE_NEW="$RUN/net.state.new.$$"
+TMPFILES="$TMPFILES $NET_STATE_NEW"
 
 # --- Top 20 processes by live CPU (+ per-process storage I/O rate) ---
 # proc-sample.py measures CPU-time deltas since the previous tick, like top.
@@ -236,8 +240,13 @@ df -P >"$DF_FILE" 2>/dev/null
 DISKS=""
 DISK_MAX_PCT=0
 DF_DEVS=""
+DF_SEEN=""
 while read -r fs blk used avail pct mount; do
   [ "$fs" = "Filesystem" ] && continue
+  # btrfs subvolumes and bind mounts repeat one filesystem under several
+  # mount points with identical numbers: report it once, at the first
+  # (shallowest) mount df lists.
+  case " $DF_SEEN " in *" $fs "*) continue ;; esac
   # /dev/path → /proc/diskstats device name. LUKS/dm mounts show up as
   # /dev/mapper/<name> in df but dm-N in diskstats, so resolve via sysfs.
   case "$fs" in
@@ -262,6 +271,7 @@ while read -r fs blk used avail pct mount; do
     /*) ;;
     *) continue ;;
   esac
+  DF_SEEN="$DF_SEEN $fs"
   DF_DEVS="$DF_DEVS $dev"
   total_gb=$(awk "BEGIN{printf \"%.1f\", $blk/1048576}")
   used_gb=$(awk "BEGIN{printf \"%.1f\", $used/1048576}")
@@ -303,7 +313,7 @@ DISK_IO_TOT=$(awk "BEGIN{printf \"%.1f\", $DISK_R_TOT + $DISK_W_TOT}")
 #     delta between this tick and the last is divided by the real elapsed
 #     milliseconds, then EMA-smoothed (0.3/0.7) for a steady label. Virtual
 #     links (docker/br/veth/bridges) are excluded so wifi/ethernet win. ---
-NET_STATE="$D/.omc_net_state"
+NET_STATE="$RUN/net.state"
 NOW_MS=$(date +%s%3N 2>/dev/null || echo ${NOW}000)
 [ -f "$NET_STATE" ] || : >"$NET_STATE" # first run: no prior counters, all rates 0
 
@@ -393,9 +403,9 @@ if command -v "$NVIDIA_SMI" >/dev/null 2>&1; then
     # the full -q -x dump (identity + clocks + the process-map input) is
     # expensive, so it's kept in a cache file refreshed at most once a minute
     # and reused on every tick in between.
-    GPUXML="$D/.omc_gpuxml_cache"
+    GPUXML="$RUN/gpu.xml"
     if [ ! -f "$GPUXML" ] || [ -n "$(find "$GPUXML" -mmin +1 2>/dev/null)" ]; then
-      GPUXML_TMP="$D/.omc_gpuxml_cache.tmp.$$"
+      GPUXML_TMP="$RUN/gpu.xml.tmp.$$"
       TMPFILES="$TMPFILES $GPUXML_TMP"
       timeout 10 "$NVIDIA_SMI" -q -x 2>/dev/null >"$GPUXML_TMP"
       [ -s "$GPUXML_TMP" ] && mv "$GPUXML_TMP" "$GPUXML"
@@ -508,7 +518,7 @@ TMPFILES="$TMPFILES $GPU_PROC_MAP"
 # extra nvidia-smi call here.
 if command -v nvidia-smi >/dev/null 2>&1; then
   if [ -z "$GPUXML" ]; then
-    GPUXML="$D/.omc_gpuxml_cache"
+    GPUXML="$RUN/gpu.xml"
   fi
   [ -s "$GPUXML" ] && awk '
     /<process_info>/ { inproc=1 }
@@ -732,7 +742,25 @@ rm -f "$DATA_DIR/.cur_names.$$" "$DATA_DIR/.new_names.$$" "$DATA_DIR/.promote.$$
 #     same way sample-json.sh feeds the app window, so the bar bell and the
 #     collector's sustained alerts always use the same numbers.
 PREFS="${OMCONTROL_ALERT_PREFS:-$DATA_DIR/alert_prefs.json}"
-THRESHOLDS_OUT=$(OMC_BACKEND="$SELF_DIR" python3 "$SELF_DIR/omc-thresholds.py" "$PREFS" 2>/dev/null || true)
+# The resolved thresholds are a pure function of the prefs file and the two
+# resolver scripts, so cache them on tmpfs keyed by those files' content
+# instead of starting python every tick.
+TH_CACHE="$RUN/thresholds.cache"
+TH_KEY=$(cat "$PREFS" "$SELF_DIR/omc-thresholds.py" "$SELF_DIR/omc_prefs.py" 2>/dev/null | cksum)
+THRESHOLDS_OUT=""
+if [ -s "$TH_CACHE" ]; then
+  {
+    IFS= read -r TH_CACHED_KEY
+    IFS= read -r TH_L1
+    IFS= read -r TH_L2
+  } <"$TH_CACHE"
+  [ "$TH_CACHED_KEY" = "$TH_KEY" ] && [ -n "$TH_L1" ] && [ -n "$TH_L2" ] &&
+    THRESHOLDS_OUT=$(printf '%s\n%s' "$TH_L1" "$TH_L2")
+fi
+if [ -z "$THRESHOLDS_OUT" ]; then
+  THRESHOLDS_OUT=$(OMC_BACKEND="$SELF_DIR" python3 "$SELF_DIR/omc-thresholds.py" "$PREFS" 2>/dev/null || true)
+  [ -n "$THRESHOLDS_OUT" ] && printf '%s\n%s\n' "$TH_KEY" "$THRESHOLDS_OUT" >"$TH_CACHE" 2>/dev/null
+fi
 ALERT_PROFILE=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '1p')
 THRESHOLDS_JSON=$(printf '%s\n' "$THRESHOLDS_OUT" | sed -n '2p')
 [ -n "$ALERT_PROFILE" ] || ALERT_PROFILE=medium

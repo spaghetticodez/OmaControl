@@ -17,6 +17,8 @@ BarWidget {
   property var barStats: ["cpu", "cputemp"]
   property string barStatMode: "name"
   property bool barShowBell: true
+  // Not used by the bar itself; kept so a save from the bar preserves it.
+  property bool barShowBuyButton: true
   property int unreadCount: 0
   property string bellColorToken: "dim"
 
@@ -304,21 +306,45 @@ BarWidget {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var parsed = JSON.parse(root.capText(text))
-          if (parsed && parsed.barShowBell !== undefined) root.barShowBell = parsed.barShowBell === true
-          if (Array.isArray(parsed)) {
-            root.barStats = parsed
-          } else if (parsed && parsed.stats) {
-            root.barStats = parsed.stats
-            if (parsed.mode === "name" || parsed.mode === "none") root.barStatMode = parsed.mode
-          }
+          root.applyBarPrefs(JSON.parse(root.capText(text)))
         } catch (e) {}
       }
     }
   }
 
+  function applyBarPrefs(parsed) {
+    if (!parsed) return
+    if (parsed.barShowBell !== undefined) root.barShowBell = parsed.barShowBell === true
+    if (parsed.showBuyButton !== undefined) root.barShowBuyButton = parsed.showBuyButton !== false
+    if (Array.isArray(parsed)) {
+      root.barStats = parsed
+    } else if (parsed.stats) {
+      root.barStats = parsed.stats
+      if (parsed.mode === "name" || parsed.mode === "none") root.barStatMode = parsed.mode
+    }
+  }
+
+  // The app window owns the Settings tab: follow its changes directly instead
+  // of re-reading barstats.json every tick. barStatsReloadTimer still picks
+  // up writes from outside the shell (CLI) within 30 s.
+  Connections {
+    target: appLoader.item
+    ignoreUnknownSignals: true
+    function onBarPrefsChanged() {
+      root.applyBarPrefs(appLoader.item.barPrefs)
+    }
+  }
+
+  Timer {
+    id: barStatsReloadTimer
+    interval: 30000
+    running: true
+    repeat: true
+    onTriggered: if (!barStatsLoadProc.running) barStatsLoadProc.running = true
+  }
+
   function saveBarPrefs() {
-    var payload = JSON.stringify({ stats: root.barStats, mode: root.barStatMode, barShowBell: root.barShowBell })
+    var payload = JSON.stringify({ stats: root.barStats, mode: root.barStatMode, barShowBell: root.barShowBell, showBuyButton: root.barShowBuyButton })
     barStatsSaveProc.command = ["/usr/bin/timeout", "-k", "2", "5", "/bin/sh", root.runnerPath, "/usr/bin/python3",
                                 root.prefsPath, "write"]
     barStatsSaveProc.pending = payload
@@ -408,7 +434,6 @@ BarWidget {
       root.recomputePoll()
       if (!collectProc.running) root.refresh()
       if (!privacyProc.running) privacyProc.running = true
-      if (!barStatsLoadProc.running) barStatsLoadProc.running = true
       if (root.barShowBell && !unreadProc.running) unreadProc.running = true
     }
   }
