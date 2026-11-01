@@ -62,7 +62,7 @@ systemctl --user enable --now ~/.config/omarchy/plugins/davedes.omcontrol/system
 ```bash
 systemctl --user disable --now omcontrol-collect
 omarchy plugin remove davedes.omcontrol
-rm -rf ~/.local/share/omcontrol   # history and settings
+rm -rf ~/.local/share/omcontrol   # optional: permanently deletes history and settings
 ```
 
 ## Development
