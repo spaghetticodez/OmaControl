@@ -52,52 +52,79 @@ NET_STATE_NEW="$D/.omc_net_state.new.$$"
 DISKIO="$D/.omc_diskio.$$"
 DF_FILE="$D/.omc_df.$$"
 PS_FILE="$D/.omc_ps.$$"
-PROC_IO_PRE="$D/.omc_proc_io_pre.$$"
-PROC_IO_POST="$D/.omc_proc_io_post.$$"
+PROC_IO_RATE="$D/.omc_proc_io_rate.$$"
 PROC_SWAP="$D/.omc_proc_swap.$$"
-TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $NET_STATE_NEW $DISKIO $DF_FILE $PS_FILE $PROC_IO_PRE $PROC_IO_POST $PROC_SWAP $DATA_DIR/.cur_names.$$ $DATA_DIR/.new_names.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.fresh.$$ $DATA_DIR/.seen.$$ $DATA_DIR/.seen.sorted.$$ $DATA_DIR/.cand.sorted.$$"
+TMPFILES="$CPU_PRE $CPU_POST $DS_PRE $DS_POST $NET_CUR $NET_STATE_NEW $DISKIO $DF_FILE $PS_FILE $PROC_IO_RATE $PROC_SWAP $DATA_DIR/.cur_names.$$ $DATA_DIR/.new_names.$$ $DATA_DIR/.promote.$$ $DATA_DIR/.fresh.$$ $DATA_DIR/.seen.$$ $DATA_DIR/.seen.sorted.$$ $DATA_DIR/.cand.sorted.$$"
 trap 'rm -f -- $TMPFILES' EXIT INT TERM
 
-# --- Top 20 processes by CPU (snapshot once; used for per-proc IO + swap) ---
-# pcpu from ps is thread-summed and can exceed 100% (e.g. 300% = 3 cores of
-# work). Divide by the core count so every surface reports average CPU across
-# cores instead — 100% = one core fully busy.
-NCORES=$(nproc 2>/dev/null || echo 1)
-ps -eo pid,pcpu,pmem,comm --sort=-pcpu --no-headers | head -20 >"$PS_FILE"
+# --- Tick-to-tick sampling state. Rewritten every tick and meaningless after
+#     a reboot, so it lives on tmpfs (/run/user/<uid>) when available instead
+#     of wearing the disk; OMCONTROL_RUN_DIR overrides (tests). ---
+if [ -z "${OMCONTROL_RUN_DIR:-}" ]; then
+  OMCONTROL_RUN_DIR="$DATA_DIR"
+  RT="/run/user/$(id -u)"
+  [ -d "$RT" ] && [ -w "$RT" ] && OMCONTROL_RUN_DIR="$RT/omcontrol"
+fi
+mkdir -p "$OMCONTROL_RUN_DIR" 2>/dev/null && chmod 700 "$OMCONTROL_RUN_DIR" 2>/dev/null
+[ -d "$OMCONTROL_RUN_DIR" ] && [ -w "$OMCONTROL_RUN_DIR" ] || OMCONTROL_RUN_DIR="$DATA_DIR"
+RUN="$OMCONTROL_RUN_DIR"
 
-# --- Per-process I/O baseline (read+write bytes) so the same 0.2s window
-#     below yields live accumulated KB/s for each process. ---
-PROC_IO_AWK='{
-  f="/proc/"$1"/io"; r=0; w=0
-  while ((getline l < f) > 0) {
-    if (l ~ /^read_bytes:/)  { split(l, a, " "); r = a[2] + 0 }
-    else if (l ~ /^write_bytes:/) { split(l, a, " "); w = a[2] + 0 }
-  }
-  close(f)
-  print $1, r, w
-}'
-awk "$PROC_IO_AWK" "$PS_FILE" >"$PROC_IO_PRE"
+# --- Top 20 processes by live CPU (+ per-process storage I/O rate) ---
+# proc-sample.py measures CPU-time deltas since the previous tick, like top.
+# ps's pcpu would be a lifetime average (CPU time / process age). pcpu is
+# thread-summed and can exceed 100% (300% = 3 cores of work); divide by the
+# core count so every surface reports average CPU across cores instead.
+NCORES=$(nproc 2>/dev/null || echo 1)
+python3 "$SELF_DIR/proc-sample.py" "$RUN/proc.state" "$PROC_IO_RATE" 20 >"$PS_FILE" 2>/dev/null
+[ -f "$PROC_IO_RATE" ] || : >"$PROC_IO_RATE"
 
 # --- Swap per process (VmSwap in kB) ---
 awk '{ f="/proc/"$1"/status"; s=0; while ((getline l < f) > 0) { if (l ~ /^VmSwap:/) { match(l, /^VmSwap: *[0-9]+/); s=substr(l,RLENGTH)+0; break } } close(f); print $1, s }' "$PS_FILE" >"$PROC_SWAP"
 
-# --- Sample capture (one 0.2s window for CPU/disk/proc-IO deltas; the
-#     network rate is a tick-to-tick delta computed later, not this window) ---
-awk '/^cpu /{print "cpu", $5+$6, $2+$3+$4+$5+$6+$7+$8; next}
-     /^cpu[0-9]+ /{sub("cpu","",$1); print $1, $5+$6, $2+$3+$4+$5+$6+$7+$8}' /proc/stat >"$CPU_PRE"
-awk '{print $3, $6, $10}' /proc/diskstats >"$DS_PRE"
-
-sleep 0.2
-
-awk '/^cpu /{print "cpu", $5+$6, $2+$3+$4+$5+$6+$7+$8; next}
-     /^cpu[0-9]+ /{sub("cpu","",$1); print $1, $5+$6, $2+$3+$4+$5+$6+$7+$8}' /proc/stat >"$CPU_POST"
+# --- CPU + disk counters. Rates are deltas against the previous tick, so
+#     they cover the whole poll interval (like the network rate below). With
+#     no usable baseline (first run, reboot, or a gap over 30s) fall back to
+#     a 0.2s window rather than averaging over the gap. ---
+CPU_STAT_AWK='/^cpu /{print "cpu", $5+$6, $2+$3+$4+$5+$6+$7+$8; next}
+     /^cpu[0-9]+ /{sub("cpu","",$1); print $1, $5+$6, $2+$3+$4+$5+$6+$7+$8}'
+STATE_CPU="$RUN/cpu.state"
+STATE_DISK="$RUN/disk.state"
+STATE_T="$RUN/sample.t"
+T_NOW=$(date +%s%3N 2>/dev/null)
+case "$T_NOW" in '' | *[!0-9]*) T_NOW=$((NOW * 1000)) ;; esac
+ELAPSED_MS=0
+if [ -s "$STATE_CPU" ] && [ -s "$STATE_DISK" ] && [ -s "$STATE_T" ]; then
+  T_PREV=$(cat "$STATE_T" 2>/dev/null)
+  case "$T_PREV" in '' | *[!0-9]*) T_PREV=0 ;; esac
+  ELAPSED_MS=$((T_NOW - T_PREV))
+fi
+if [ "$ELAPSED_MS" -gt 0 ] && [ "$ELAPSED_MS" -le 30000 ]; then
+  CPU_BASE="$STATE_CPU"
+  DS_BASE="$STATE_DISK"
+else
+  awk "$CPU_STAT_AWK" /proc/stat >"$CPU_PRE"
+  awk '{print $3, $6, $10}' /proc/diskstats >"$DS_PRE"
+  sleep 0.2
+  T_PRE=$T_NOW
+  T_NOW=$(date +%s%3N 2>/dev/null)
+  case "$T_NOW" in '' | *[!0-9]*) T_NOW=$((T_PRE + 200)) ;; esac
+  ELAPSED_MS=$((T_NOW - T_PRE))
+  [ "$ELAPSED_MS" -gt 0 ] || ELAPSED_MS=200
+  CPU_BASE="$CPU_PRE"
+  DS_BASE="$DS_PRE"
+fi
+awk "$CPU_STAT_AWK" /proc/stat >"$CPU_POST"
 awk '{print $3, $6, $10}' /proc/diskstats >"$DS_POST"
 
-# --- Per-process I/O post (accumulated) ---
-awk "$PROC_IO_AWK" "$PS_FILE" >"$PROC_IO_POST"
+# --- Disk IO rates (sectors -> KB/s over the elapsed window) ---
+awk -v ms="$ELAPSED_MS" 'NR==FNR { r[$1]=$2; w[$1]=$3; next }
+  { if (!($1 in r)) { r[$1]=$2; w[$1]=$3; next }
+    dr=($2-r[$1])*512/1024*1000/ms; dw=($3-w[$1])*512/1024*1000/ms;
+    if (dr<0) dr=0; if (dw<0) dw=0;
+    printf "%s %.1f %.1f\n", $1, dr, dw }' "$DS_BASE" "$DS_POST" >"$DISKIO"
 
 # --- Aggregate CPU usage ---
-set -- $(awk '$1=="cpu"{print $2,$3}' "$CPU_PRE")
+set -- $(awk '$1=="cpu"{print $2,$3}' "$CPU_BASE")
 PREV_IDLE=$1
 PREV_TOTAL=$2
 set -- $(awk '$1=="cpu"{print $2,$3}' "$CPU_POST")
@@ -117,12 +144,17 @@ CORES_LIST=$(awk 'NR==FNR { idle[$1]=$2; tot[$1]=$3; next }
     i = $2 - idle[$1]; t = $3 - tot[$1];
     if (t > 0) pct = (1 - i / t) * 100; else pct = 0;
     printf "{\"id\":%d,\"pct\":%.1f},", $1, pct
-  }' "$CPU_PRE" "$CPU_POST")
+  }' "$CPU_BASE" "$CPU_POST")
 if [ -n "$CORES_LIST" ]; then
   CORES="[${CORES_LIST%,}]"
 else
   CORES="[]"
 fi
+
+# Keep this tick's counters as the next tick's baseline.
+mv -f "$CPU_POST" "$STATE_CPU" 2>/dev/null
+mv -f "$DS_POST" "$STATE_DISK" 2>/dev/null
+echo "$T_NOW" >"$STATE_T" 2>/dev/null
 
 # --- Load average ---
 LOAD_1=$(awk '{print $1}' /proc/loadavg)
@@ -199,13 +231,7 @@ if [ -z "$CPU_TEMP" ]; then
 fi
 CPU_TEMP=${CPU_TEMP:-0}
 
-# --- Disk IO rates (bytes->KB/s) + df usage ---
-awk 'NR==FNR { r[$1]=$2; w[$1]=$3; next }
-  { if (!($1 in r)) { r[$1]=$2; w[$1]=$3; next }
-    dr=($2-r[$1])*512*5/1024; dw=($3-w[$1])*512*5/1024;
-    if (dr<0) dr=0; if (dw<0) dw=0;
-    printf "%s %.1f %.1f\n", $1, dr, dw }' "$DS_PRE" "$DS_POST" >"$DISKIO"
-
+# --- Disk usage (df) ---
 df -P >"$DF_FILE" 2>/dev/null
 DISKS=""
 DISK_MAX_PCT=0
@@ -495,13 +521,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   ' "$GPUXML" >"$GPU_PROC_MAP"
 fi
 
-# --- Per-process disk I/O rate (KB/s, from the 0.2s window) ---
-PROC_IO_RATE="$D/.omc_proc_io_rate.$$"
-TMPFILES="$TMPFILES $PROC_IO_RATE"
-awk 'NR==FNR { r[$1]=$2; w[$1]=$3; next }
-  { rr = ($2 - r[$1]) * 5 / 1024; ww = ($3 - w[$1]) * 5 / 1024
-    if (rr < 0) rr = 0; if (ww < 0) ww = 0
-    print $1, (rr + ww) }' "$PROC_IO_PRE" "$PROC_IO_POST" >"$PROC_IO_RATE"
+# --- Per-process disk I/O rate (KB/s) comes from proc-sample.py above. ---
 
 PROCS=$(awk '
   FILENAME == gpumap { gpu[$1]=$2; next }

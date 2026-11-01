@@ -25,6 +25,8 @@ trap 'rm -rf "$T"' EXIT INT TERM
 
 export OMCONTROL_DATA_DIR="$T"
 export OMCONTROL_DB="$T/history.db"
+# Tick-to-tick sampling state must never touch the live /run/user baseline.
+export OMCONTROL_RUN_DIR="$T/run"
 
 q() { sqlite3 -cmd ".timeout 1500" "$1" "$2" 2>/dev/null; }
 
@@ -94,6 +96,15 @@ import json, sys
 json.load(open(sys.argv[1]))
 PY
 check_eq "collect #2 (steady state): JSON parses" "0" "$?"
+
+# Tick-to-tick baselines live in the run dir, not the persistent data dir.
+n=0
+for f in cpu.state disk.state sample.t proc.state; do
+  [ -s "$OMCONTROL_RUN_DIR/$f" ] && n=$((n + 1))
+done
+check_eq "collect: tick state written to the run dir" "4" "$n"
+check_eq "collect: no tick state in the data dir" "0" \
+  "$(find "$T" -maxdepth 1 \( -name 'cpu.state' -o -name 'proc.state' \) | wc -l | tr -d ' ')"
 
 # Threshold selection flows from alert_prefs.json: a stored profile must be
 # reflected in the resolved thresholds the collector emits.

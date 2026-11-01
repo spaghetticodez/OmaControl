@@ -28,7 +28,7 @@ run_collect() {
   else
     OMC_NVIDIA_SMI="$T/no-such-nvidia-smi"
   fi
-  export OMCONTROL_DATA_DIR="$D" OMCONTROL_DB="$D/history.db" OMC_NVIDIA_SMI
+  export OMCONTROL_DATA_DIR="$D" OMCONTROL_DB="$D/history.db" OMCONTROL_RUN_DIR="$D/run" OMC_NVIDIA_SMI
   run_interp "$ROOT/backend/collect.sh" >"$D/out.json" 2>"$D/out.err"
   rc=$?
   check_eq "gpu ($LABEL): collect exits 0" "0" "$rc"
