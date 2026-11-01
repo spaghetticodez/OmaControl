@@ -118,6 +118,63 @@ def cmdline_of(pid):
     except Exception:
         return []
 
+# Interpreters whose first non-option argument names the real program.
+INTERPRETERS = re.compile(
+    r"^(python[0-9.]*|pypy[0-9.]*|node|nodejs|bun|deno|ruby|perl|php[0-9.]*|"
+    r"lua[0-9.]*|luajit|bash|sh|dash|zsh|fish|ksh|tclsh|wish)$")
+# Options that carry inline code or values; their argument is never stored.
+INLINE_CODE_OPTS = {"-c", "-e", "-E", "--eval", "-p", "--print", "-r", "--require"}
+
+def safe_command(args):
+    """Name a command without persisting its arguments.
+
+    argv routinely carries tokens, passwords, URLs with credentials and
+    private paths, and app_meta rows live indefinitely. Keep only the
+    program's basename, plus the script or module basename for
+    interpreters. Inline code (-c/-e) is never stored.
+    """
+    if not args:
+        return ""
+    first = args[0]
+    # Chromium/Electron rewrite argv into one space-joined string.
+    if len(args) == 1 and " " in first:
+        first = first.split(" ", 1)[0]
+    prog = os.path.basename(first) or first
+    if not INTERPRETERS.match(prog):
+        return prog[:110]
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a in INLINE_CODE_OPTS:
+            break
+        if a == "-m" and i + 1 < len(args):
+            return ("%s -m %s" % (prog, args[i + 1]))[:110]
+        if a.startswith("-"):
+            i += 1
+            continue
+        return ("%s %s" % (prog, os.path.basename(a))).strip()[:110]
+    return prog[:110]
+
+# Rows written before safe_command() embedded raw argv, either as
+# "Command: <argv>" or as "<description> · <argv>" (always source 'unknown').
+# New rows mark the sanitized form with "Program: ", so these patterns only
+# ever match legacy data and the purge is idempotent.
+LEGACY_CMDLINE_SQL = (
+    "desc LIKE '%Command: %' OR "
+    "(source = 'unknown' AND desc LIKE '% · %' AND desc NOT LIKE '% · Program: %')")
+
+def purge_legacy_cmdlines(con):
+    """Blank legacy raw-argv descriptions; they re-resolve on next sight."""
+    con.execute("PRAGMA secure_delete=ON")
+    cur = con.execute(
+        "UPDATE app_meta SET desc='', updated=0 WHERE " + LEGACY_CMDLINE_SQL)
+    con.commit()
+    if cur.rowcount:
+        try:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+
 def resolve(name, pid):
     """Return (exe, pkg, publisher, desc, verified, source)."""
     exe = sh(["readlink", f"/proc/{pid}/exe"])
@@ -142,7 +199,7 @@ def resolve(name, pid):
         if args:
             if args[0].startswith("/") and os.path.exists(args[0]) and not desc:
                 exe = args[0]
-            desc = "Command: " + " ".join(args)[:110]
+            desc = "Program: " + safe_command(args)
         return (exe, "", "Unknown", desc, 0, "unknown")
     # Flatpak app dirs
     if re.search(r"/(?:var/lib|home/|\.)flatpak/(?:app|repo)/", exe) or exe.startswith("/var/lib/flatpak"):
@@ -171,8 +228,8 @@ def resolve(name, pid):
     if not desc or "Unknown system process" in desc:
         args = cmdline_of(pid)
         if args:
-            cmd = " ".join(args)[:110]
-            desc = "Command: " + cmd if not desc else desc + " · " + cmd
+            cmd = safe_command(args)
+            desc = "Program: " + cmd if not desc else desc + " · Program: " + cmd
     return (exe, "", "Unknown", desc[:120], 0, "unknown")
 
 def main():
@@ -182,6 +239,7 @@ def main():
         desc TEXT, verified INTEGER DEFAULT 0, source TEXT DEFAULT 'unknown',
         first_seen INTEGER, updated INTEGER);""")
     con.commit()
+    purge_legacy_cmdlines(con)
     now = NOW
     seen = {}
     for line in sys.stdin:
