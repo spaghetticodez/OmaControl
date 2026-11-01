@@ -162,15 +162,41 @@ SWAP_USED_MB=$(((SWAP_TOTAL_KB - SWAP_FREE_KB) / 1024))
 
 # --- CPU temperature ---
 CPU_TEMP=""
-for zone in /sys/class/thermal/thermal_zone*/temp; do
-  TYPE=$(echo "$zone" | sed 's|/temp||;s|.*/||')
-  if [ "$TYPE" = "x86_pkg_temp" ] || [ -z "$CPU_TEMP" ]; then
-    RAW=$(cat "$zone" 2>/dev/null)
-    if [ -n "$RAW" ]; then
-      CPU_TEMP=$((RAW / 1000))
-    fi
-  fi
+# Prefer the CPU package sensor exposed by hwmon (AMD k10temp Tctl, zenpower
+# Tdie, Intel coretemp "Package id 0"). Many desktops, AMD in particular,
+# expose no /sys/class/thermal zones at all.
+for hw in /sys/class/hwmon/hwmon*; do
+  [ -n "$CPU_TEMP" ] && break
+  HWNAME=$(cat "$hw/name" 2>/dev/null)
+  case "$HWNAME" in
+    k10temp | zenpower | coretemp) ;;
+    *) continue ;;
+  esac
+  for lbl in "$hw"/temp*_label; do
+    [ -f "$lbl" ] || continue
+    case "$(cat "$lbl" 2>/dev/null)" in
+      Tctl | Tdie | Package\ id\ 0)
+        RAW=$(cat "${lbl%_label}_input" 2>/dev/null)
+        if [ -n "$RAW" ]; then
+          CPU_TEMP=$((RAW / 1000))
+          break
+        fi
+        ;;
+    esac
+  done
 done
+# Fall back to thermal zones: x86_pkg_temp by its type file, else the first zone.
+if [ -z "$CPU_TEMP" ]; then
+  for zone in /sys/class/thermal/thermal_zone*/temp; do
+    TYPE=$(cat "${zone%/temp}/type" 2>/dev/null)
+    if [ "$TYPE" = "x86_pkg_temp" ] || [ -z "$CPU_TEMP" ]; then
+      RAW=$(cat "$zone" 2>/dev/null)
+      if [ -n "$RAW" ]; then
+        CPU_TEMP=$((RAW / 1000))
+      fi
+    fi
+  done
+fi
 CPU_TEMP=${CPU_TEMP:-0}
 
 # --- Disk IO rates (bytes->KB/s) + df usage ---
