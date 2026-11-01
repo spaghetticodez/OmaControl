@@ -19,7 +19,10 @@ TMPROOT="${TMPDIR:-/tmp}"
 T=$(mktemp -d "$TMPROOT/omc-appmeta.XXXXXX")
 TOOL_PID=""
 cleanup() {
-  [ -n "$TOOL_PID" ] && { pkill -P "$TOOL_PID" 2>/dev/null; kill "$TOOL_PID" 2>/dev/null; }
+  [ -n "$TOOL_PID" ] && {
+    pkill -P "$TOOL_PID" 2>/dev/null
+    kill "$TOOL_PID" 2>/dev/null
+  }
   rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
