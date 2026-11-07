@@ -16,6 +16,13 @@ sshd
 sshd-*
 uwsm
 uwsm-*
+# Omarchy 4.5+: start-hyprland is the compositor's parent (watchdog), the
+# session runs as wayland-wm@ / wayland-session-* units, and omarchy-*
+# covers Omarchy's own daemons and units (shell launcher, sleep lock,
+# monitor and crash watchers, fcitx5 unit) and its updater.
+start-hyprland
+wayland-*
+omarchy-*
 
 # compositor, shell, lock and idle
 Hyprland

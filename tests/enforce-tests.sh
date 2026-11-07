@@ -98,7 +98,8 @@ fi
 SELF_DIR="$ROOT/backend"
 . "$ROOT/backend/protected.sh"
 for n in Hyprland quickshell pipewire wireplumber systemd systemd-logind \
-  xdg-desktop-por hyprlock dbus-broker-lau gnome-keyring-d; do
+  xdg-desktop-por hyprlock dbus-broker-lau gnome-keyring-d \
+  start-hyprland omarchy-launch- omarchy-system- omarchy-hyprlan omarchy-update; do
   if is_protected "$n"; then ok "protected: $n"; else fail "protected: $n"; fi
 done
 for n in firefox omc-blocktest brave; do
@@ -109,7 +110,9 @@ done
 cat >"$T/prot.json" <<'EOF'
 {"rules":[
   {"kind":"app","action":"disable","pattern":"Hyprland","enabled":true},
-  {"kind":"service","action":"disable","pattern":"wireplumber.service","enabled":true}
+  {"kind":"service","action":"disable","pattern":"wireplumber.service","enabled":true},
+  {"kind":"service","action":"disable","pattern":"wayland-wm@hyprland.desktop.service","enabled":true},
+  {"kind":"service","action":"disable","pattern":"omarchy-sleep-lock.service","enabled":true}
 ]}
 EOF
 OMCONTROL_DATA_DIR="$T/pdata" OMCONTROL_RULES="$T/prot.json" OMCONTROL_DB="$T/pdata/history.db" \
@@ -121,6 +124,8 @@ assert d["killed"] == [], d
 errs = {e.get("pattern"): e.get("error") for e in d["errors"]}
 assert errs.get("Hyprland") == "protected session process", d
 assert errs.get("wireplumber.service") == "protected session process", d
+assert errs.get("wayland-wm@hyprland.desktop.service") == "protected session process", d
+assert errs.get("omarchy-sleep-lock.service") == "protected session process", d
 PY
 check_eq "enforce: protected app and service rules refused" "0" "$?"
 
