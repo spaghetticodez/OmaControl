@@ -138,10 +138,9 @@ check_eq "collect: no app_exit for a still-running process" "0" \
   "$(q "$OMCONTROL_DB" "SELECT count(*) FROM events WHERE type='app_exit' AND app='$PID1_NAME';")"
 
 # New-app detection: a name is a candidate on its first tick and a new app
-# on the next tick it is still running, exactly once. A throwaway copy of
-# sleep under a unique 15-character name is the subject.
-cp "$(command -v sleep)" "$T/omc-newapp-test"
-"$T/omc-newapp-test" 60 &
+# on the next tick it is still running, exactly once. A throwaway
+# process under a unique 15-character name is the subject.
+spawn_named "$T/omc-newapp-test"
 NEWAPP_PID=$!
 sleep 0.2
 run_interp "$ROOT/backend/collect.sh" >"$T/na1.json" 2>/dev/null

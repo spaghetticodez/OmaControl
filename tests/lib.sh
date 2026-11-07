@@ -72,3 +72,13 @@ run_interp() {
       ;;
   esac
 }
+
+# spawn_named PATH: start a long-running throwaway process named (comm)
+# after basename PATH; its pid is left in $!. A shell script rather than a
+# renamed copy of sleep: multi-call coreutils (uutils, Ubuntu 26.04+) pick
+# the tool by file name, so a renamed copy exits at once.
+spawn_named() {
+  printf '#!/bin/sh\nwhile :; do sleep 1; done\n' >"$1"
+  chmod 700 "$1"
+  "$1" &
+}

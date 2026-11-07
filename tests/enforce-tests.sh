@@ -145,9 +145,8 @@ else
 fi
 
 # --- kill-on-launch (--apps, as the bar runs it every tick) ------------------
-# A throwaway copy of sleep under a unique name is the only possible target.
-cp "$(command -v sleep)" "$T/omc-blocktest"
-"$T/omc-blocktest" 30 &
+# A throwaway process under a unique name is the only possible target.
+spawn_named "$T/omc-blocktest"
 VICTIM=$!
 cat >"$T/apps.json" <<'EOF'
 {"rules":[
