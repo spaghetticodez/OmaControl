@@ -2779,7 +2779,10 @@ PanelWindow {
                   fillMode: Image.PreserveAspectFit
                   smooth: true
                   mipmap: true
-                  source: "https://storage.ko-fi.com/cdn/kofi5.png?v=6"
+                  // A QML Image fetches its source even while hidden, so
+                  // only point it at Ko-fi once the prefs are read and the
+                  // button is on: switched off means no request at all.
+                  source: root.barPrefsLoaded && root.barPrefs.showBuyButton !== false ? "https://storage.ko-fi.com/cdn/kofi5.png?v=6" : ""
                 }
                 Rectangle {
                   visible: kofiImage.status === Image.Error || kofiImage.status === Image.Null || kofiImage.status === Image.Loading
